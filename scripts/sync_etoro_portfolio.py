@@ -45,8 +45,8 @@ from dotenv import load_dotenv  # noqa: E402
 from etoropy import EToroTrading  # noqa: E402
 
 # eToro exchange suffixes Yahoo spells differently; "" drops the suffix
-# (.US and .EXT, extended hours, are ordinary US listings).
-_SUFFIX_TO_YAHOO = {".ZU": ".SW", ".NV": ".AS", ".ASX": ".AX", ".US": "", ".EXT": ""}
+# (.US, .RTH regular hours and .EXT extended hours are ordinary US listings).
+_SUFFIX_TO_YAHOO = {".ZU": ".SW", ".NV": ".AS", ".ASX": ".AX", ".US": "", ".RTH": "", ".EXT": ""}
 _SHARED_SUFFIXES = {
     ".L", ".DE", ".PA", ".HK", ".MI", ".MC", ".ST", ".OL", ".CO", ".HE",
     ".VI", ".WA", ".BR", ".BD",

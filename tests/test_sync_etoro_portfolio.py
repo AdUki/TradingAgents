@@ -29,6 +29,7 @@ _spec.loader.exec_module(sync)
         ("BHP.ASX", "Stocks", "BHP.AX"),
         ("JD.US", "Stocks", "JD"),
         ("TSLA.EXT", "Stocks", "TSLA"),
+        ("META.RTH", "Stocks", "META"),
         ("BARC.L", "Stocks", "BARC.L"),
         ("SIE.DE", "Stocks", "SIE.DE"),
         ("0939.HK", "Stocks", "0939.HK"),
@@ -51,6 +52,7 @@ def test_maps_analyzable_instruments(symbol, type_name, expected):
         ("SPX500", "Indices"),
         ("IPO56.l", "Stocks"),
         ("XYZ.QQ", "Stocks"),
+        ("ZYNE.CVR", "Stocks"),
     ],
 )
 def test_skips_what_yahoo_would_misread(symbol, type_name):
