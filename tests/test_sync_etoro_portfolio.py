@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import pytest
 pytest.importorskip("etoropy")
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "sync_etoro_portfolio.py"
+sys.path.insert(0, str(_SCRIPT.parent))  # the script imports etoro_api
 _spec = importlib.util.spec_from_file_location("sync_etoro_portfolio", _SCRIPT)
 sync = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sync)
@@ -61,7 +63,7 @@ def test_skips_what_yahoo_would_misread(symbol, type_name):
 
 @pytest.mark.unit
 def test_build_tickers_dedupes_and_reports_skips():
-    positions = [SimpleNamespace(instrument_id=i) for i in (1001, 1001, 18, 999)]
+    positions = [{"instrumentID": i} for i in (1001, 1001, 18, 999)]
     infos = {
         1001: SimpleNamespace(symbol_full="AAPL", instrument_type_id=5),
         18: SimpleNamespace(symbol_full="GOLD", instrument_type_id=2),

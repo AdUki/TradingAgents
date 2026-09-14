@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Sync portfolio.txt with the open positions in your eToro account.
 
-Reads positions through the eToro Public API (via the etoropy SDK) and writes
-their Yahoo Finance tickers to portfolio.txt, which scripts/portfolio_review.py
-analyzes. Only stocks, ETFs and crypto are kept: eToro names currencies,
-commodities and indices like unrelated Yahoo stocks (GOLD, OIL, SPX500).
-Copy-trading (mirror) positions are not included.
+Reads positions through the eToro Public API and writes their Yahoo Finance
+tickers to portfolio.txt, which scripts/portfolio_review.py analyzes. Only
+stocks, ETFs and crypto are kept: eToro names currencies, commodities and
+indices like unrelated Yahoo stocks (GOLD, OIL, SPX500). Copy-trading (mirror)
+positions are not included.
 
 Also saves an account snapshot (cash, pending orders, every position with its
 stop loss / take profit) to ~/.tradingagents/etoro/account.json for
@@ -47,6 +47,8 @@ ACCOUNT_SNAPSHOT = Path.home() / ".tradingagents" / "etoro" / "account.json"
 if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != VENV_PYTHON.parent.parent.resolve():
     os.execv(VENV_PYTHON, [str(VENV_PYTHON), *sys.argv])
 
+import etoro_api  # noqa: E402
+import httpx  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 from etoropy import EToroTrading  # noqa: E402
 
@@ -88,15 +90,15 @@ def to_yahoo_symbol(symbol_full: str, type_description: str) -> str | None:
 
 
 def build_tickers(
-    positions: Iterable,
+    positions: Iterable[dict],
     infos: Mapping[int, object],
     type_names: Mapping[int, str],
 ) -> tuple[list[str], list[str]]:
-    """Sorted unique Yahoo tickers for ``positions``, plus a note per skipped instrument."""
+    """Sorted unique Yahoo tickers for raw eToro ``positions``, plus a note per skipped instrument."""
     tickers: set[str] = set()
     skipped: dict[int, str] = {}
     for position in positions:
-        instrument_id = position.instrument_id
+        instrument_id = position["instrumentID"]
         info = infos.get(instrument_id)
         if info is None:
             skipped[instrument_id] = f"instrument {instrument_id}: no metadata from eToro"
@@ -110,59 +112,67 @@ def build_tickers(
     return sorted(tickers), list(skipped.values())
 
 
-def pending_orders_amount(portfolio) -> float:
+def pending_orders_amount(portfolio: dict) -> float:
     """Cash reserved by pending orders (eToro's available-cash formula)."""
     manual_opens = sum(
-        order.amount for order in portfolio.orders_for_open if not (order.model_extra or {}).get("mirrorID")
+        order.get("amount", 0.0) for order in portfolio.get("ordersForOpen", []) if not order.get("mirrorID")
     )
-    return manual_opens + sum(order.amount for order in portfolio.orders)
+    return manual_opens + sum(order.get("amount", 0.0) for order in portfolio.get("orders", []))
 
 
-def mirrors_invested(portfolio) -> float:
+def mirrors_invested(portfolio: dict) -> float:
     """Money in copy-trading, per eToro's total-invested formula."""
     return sum(
-        sum(p.amount for p in mirror.positions) + mirror.available_amount - mirror.closed_positions_net_profit
-        for mirror in portfolio.mirrors
+        sum(p.get("amount", 0.0) for p in mirror.get("positions", []))
+        + mirror.get("availableAmount", 0.0)
+        - mirror.get("closedPositionsNetProfit", 0.0)
+        for mirror in portfolio.get("mirrors", [])
     )
 
 
-def build_snapshot(portfolio, infos: Mapping[int, object], type_names: Mapping[int, str], mode: str) -> dict:
+def build_snapshot(portfolio: dict, infos: Mapping[int, object], type_names: Mapping[int, str], mode: str) -> dict:
     positions = []
-    for p in portfolio.positions:
-        info = infos.get(p.instrument_id)
+    for p in portfolio.get("positions", []):
+        info = infos.get(p["instrumentID"])
         type_name = type_names.get(info.instrument_type_id, "") if info else ""
         positions.append({
-            "position_id": p.position_id,
-            "instrument_id": p.instrument_id,
-            "symbol_full": info.symbol_full if info else str(p.instrument_id),
+            "position_id": p["positionID"],
+            "instrument_id": p["instrumentID"],
+            "symbol_full": info.symbol_full if info else str(p["instrumentID"]),
             "ticker": to_yahoo_symbol(info.symbol_full, type_name) if info else None,
-            "is_buy": p.is_buy,
-            "leverage": p.leverage,
-            "amount": p.amount,
-            "units": p.units,
-            "open_rate": p.open_rate,
-            "open_date": p.open_date_time,
-            "stop_loss_rate": p.stop_loss_rate,
-            "take_profit_rate": p.take_profit_rate,
-            "is_trailing_stop": p.is_tsl_enabled,
+            "is_buy": p["isBuy"],
+            "leverage": p.get("leverage"),
+            "amount": p.get("amount", 0.0),
+            "units": p.get("units", 0.0),
+            "open_rate": p["openRate"],
+            "open_date": p.get("openDateTime"),
+            "stop_loss_rate": p.get("stopLossRate"),
+            "take_profit_rate": p.get("takeProfitRate"),
+            "is_trailing_stop": p.get("isTslEnabled"),
         })
     return {
         "synced_at": datetime.datetime.now().isoformat(timespec="minutes"),
         "mode": mode,
-        "credit": portfolio.credit,
+        "credit": portfolio.get("credit", 0.0),
         "pending_orders_amount": pending_orders_amount(portfolio),
         "mirrors_invested": mirrors_invested(portfolio),
         "positions": positions,
     }
 
 
-async def fetch_portfolio() -> tuple[object, dict[int, object], dict[int, str]]:
+async def fetch_instruments(instrument_ids: list[int]) -> tuple[dict[int, object], dict[int, str]]:
     async with EToroTrading() as etoro:
-        portfolio = (await etoro.get_portfolio()).client_portfolio
-        ids = sorted({p.instrument_id for p in portfolio.positions})
-        infos = {i.instrument_id: i for i in await etoro.resolver.get_instrument_info_batch(ids)}
+        infos = await etoro.resolver.get_instrument_info_batch(instrument_ids) if instrument_ids else []
         types = await etoro.rest.market_data.get_instrument_types()
     type_names = {t.instrument_type_id: t.instrument_type_description for t in types.instrument_types}
+    return {i.instrument_id: i for i in infos}, type_names
+
+
+def fetch_portfolio() -> tuple[dict, dict[int, object], dict[int, str]]:
+    with httpx.Client() as client:
+        portfolio = etoro_api.get_portfolio(client)
+    instrument_ids = sorted({p["instrumentID"] for p in portfolio.get("positions", [])})
+    infos, type_names = asyncio.run(fetch_instruments(instrument_ids))
     return portfolio, infos, type_names
 
 
@@ -194,18 +204,22 @@ def main() -> int:
         return 1
 
     try:
-        portfolio, infos, type_names = asyncio.run(fetch_portfolio())
+        portfolio, infos, type_names = fetch_portfolio()
     except Exception as exc:  # noqa: BLE001 - any API failure keeps the last synced list
         print(f"eToro sync failed ({type(exc).__name__}: {exc}); portfolio.txt left unchanged.")
         return 1
 
-    tickers, skipped = build_tickers(portfolio.positions, infos, type_names)
-    print(f"{len(portfolio.positions)} open positions -> {len(tickers)} tickers: {', '.join(tickers) or '(none)'}")
+    positions = portfolio.get("positions", [])
+    tickers, skipped = build_tickers(positions, infos, type_names)
+    print(f"{len(positions)} open positions -> {len(tickers)} tickers: {', '.join(tickers) or '(none)'}")
     for note in skipped:
         print(f"  skipped {note}")
-    copied = sum(len(m.positions) for m in portfolio.mirrors)
+    copied = sum(len(m.get("positions", [])) for m in portfolio.get("mirrors", []))
     if copied:
         print(f"  not included: {copied} copy-trading positions")
+    pending = len(portfolio.get("ordersForOpen", [])) + len(portfolio.get("orders", []))
+    if pending:
+        print(f"  {pending} pending orders reserve ${pending_orders_amount(portfolio):,.2f}")
 
     if args.dry_run:
         return 0
