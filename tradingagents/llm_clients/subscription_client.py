@@ -55,6 +55,30 @@ class SubscriptionCLIError(RuntimeError):
     """Raised when a subscription-backed CLI cannot produce a response."""
 
 
+class SubscriptionUsageLimitError(SubscriptionCLIError):
+    """Raised when the subscription's usage limit is used up.
+
+    Every call fails the same way until the limit resets, so callers should
+    stop or wait instead of moving on to the next analysis.
+    """
+
+
+# How Claude Code words a used-up subscription, e.g. "You've hit your session
+# limit · resets 4am"; older versions printed "Claude AI usage limit reached|<epoch>".
+_USAGE_LIMIT_PREFIXES = (
+    "you've hit your",
+    "you've reached your",
+    "you're out of usage credits",
+    "your org is out of usage",
+    "claude ai usage limit reached",
+)
+
+
+def _is_usage_limit(message: str) -> bool:
+    lines = message.replace("’", "'").lower().splitlines()
+    return any(line.strip().startswith(_USAGE_LIMIT_PREFIXES) for line in lines)
+
+
 def _stringify_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -211,6 +235,42 @@ def _parse_tool_calls(text: str, tool_names: set[str]) -> list[dict[str, Any]] |
     return None
 
 
+# An answer this short that reads like a usage-limit notice is the notice, even
+# if the CLI didn't flag it as an error; real analyst replies are far longer.
+_MAX_NOTICE_CHARS = 300
+
+
+def _claude_answer(result: subprocess.CompletedProcess[str]) -> str:
+    """The model's answer from ``claude --print --output-format json``.
+
+    Raises SubscriptionUsageLimitError when the subscription is used up and
+    SubscriptionCLIError for any other failure.
+    """
+    stdout = (result.stdout or "").strip()
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        payload = None
+
+    if not isinstance(payload, dict):
+        details = (result.stderr or "").strip() or stdout or f"exit code {result.returncode}"
+        _raise_cli_error(details)
+    answer = str(payload.get("result") or "").strip()
+    if payload.get("is_error") or result.returncode != 0:
+        _raise_cli_error(answer or str(payload.get("subtype") or f"exit code {result.returncode}"))
+    if not answer:
+        raise SubscriptionCLIError("Claude Code completed but produced no output")
+    if len(answer) <= _MAX_NOTICE_CHARS and _is_usage_limit(answer):
+        _raise_cli_error(answer)
+    return answer
+
+
+def _raise_cli_error(details: str) -> None:
+    if _is_usage_limit(details):
+        raise SubscriptionUsageLimitError(f"Claude usage limit reached: {details}")
+    raise SubscriptionCLIError(f"claude-code failed: {details}")
+
+
 class SubscriptionCLIChatModel(BaseChatModel):
     """Chat model that shells out to Codex CLI or Claude Code."""
 
@@ -334,8 +394,10 @@ class SubscriptionCLIChatModel(BaseChatModel):
         cmd = [
             self.command,
             "--print",
+            # JSON flags a failed call (is_error) so an error notice such as a
+            # used-up usage limit is never mistaken for the model's answer.
             "--output-format",
-            "text",
+            "json",
             "--no-session-persistence",
             # The model plays a TradingAgents role, not a coding agent: no Claude
             # Code tools or MCP servers (data tools are emulated above).
@@ -351,13 +413,11 @@ class SubscriptionCLIChatModel(BaseChatModel):
         else:
             cmd.extend(["--system-prompt", _DEFAULT_SYSTEM_PROMPT])
             prompt = f"[system]\n{system}\n\n{prompt}"
-        result = self._run_subprocess(cmd, prompt)
-        text = result.stdout.strip()
-        if not text:
-            raise SubscriptionCLIError("Claude Code completed but produced no output")
-        return text
+        return _claude_answer(self._run_subprocess(cmd, prompt, check=False))
 
-    def _run_subprocess(self, cmd: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+    def _run_subprocess(
+        self, cmd: list[str], prompt: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
         try:
             return subprocess.run(
                 cmd,
@@ -365,7 +425,7 @@ class SubscriptionCLIChatModel(BaseChatModel):
                 text=True,
                 capture_output=True,
                 timeout=self.timeout,
-                check=True,
+                check=check,
                 cwd=self.workdir or os.getcwd(),
             )
         except FileNotFoundError as exc:

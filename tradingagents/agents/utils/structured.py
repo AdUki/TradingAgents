@@ -24,6 +24,8 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from tradingagents.llm_clients.subscription_client import SubscriptionUsageLimitError
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
@@ -79,6 +81,8 @@ def invoke_structured_or_freetext(
                 # as a structured miss and fall back, with a clear reason.
                 raise ValueError("structured output returned no parsed result")
             return render(result)
+        except SubscriptionUsageLimitError:
+            raise  # a free-text retry would hit the same used-up limit
         except Exception as exc:
             logger.warning(
                 "%s: structured-output invocation failed (%s); retrying once as free text",

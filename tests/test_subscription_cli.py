@@ -1,3 +1,4 @@
+import json
 import subprocess
 
 import pytest
@@ -5,10 +6,18 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel
 
+from tradingagents.agents.utils.structured import invoke_structured_or_freetext
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.model_catalog import get_model_options
-from tradingagents.llm_clients.subscription_client import SubscriptionCLIChatModel, _extract_json
+from tradingagents.llm_clients.subscription_client import (
+    SubscriptionCLIChatModel,
+    SubscriptionCLIError,
+    SubscriptionUsageLimitError,
+    _extract_json,
+)
+
+USAGE_LIMIT_NOTICE = "You've hit your session limit · resets 4am (Europe/Bratislava)"
 
 
 class Rating(BaseModel):
@@ -28,14 +37,31 @@ def _claude(tmp_path, **kwargs):
     )
 
 
+def _claude_json(result, is_error=False, status=None):
+    """What ``claude --print --output-format json`` writes to stdout."""
+    return json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": is_error,
+        "api_error_status": status,
+        "result": result,
+    })
+
+
 def _fake_cli(monkeypatch, replies):
-    """Patch subprocess.run to return ``replies`` in order; returns the recorded calls."""
+    """Patch subprocess.run to answer with ``replies`` in order; returns the recorded calls.
+
+    A reply is the model's text, or a ready CompletedProcess for failures.
+    """
     calls = []
     replies = list(replies)
 
     def fake_run(cmd, **kwargs):
         calls.append({"cmd": cmd, "input": kwargs["input"]})
-        return subprocess.CompletedProcess(cmd, 0, stdout=replies.pop(0), stderr="")
+        reply = replies.pop(0)
+        if isinstance(reply, subprocess.CompletedProcess):
+            return reply
+        return subprocess.CompletedProcess(cmd, 0, stdout=_claude_json(reply), stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     return calls
@@ -85,20 +111,14 @@ def test_codex_cli_uses_output_last_message(monkeypatch, tmp_path):
     assert result.content == "subscription response"
 
 
-def test_claude_cli_reads_stdout(monkeypatch, tmp_path):
+def test_claude_cli_reads_the_json_result(monkeypatch, tmp_path):
     def fake_run(cmd, input, text, capture_output, timeout, check, cwd):
-        assert cmd[:3] == ["claude", "--print", "--output-format"]
-        return subprocess.CompletedProcess(cmd, 0, stdout="claude response\n", stderr="")
+        assert cmd[:4] == ["claude", "--print", "--output-format", "json"]
+        return subprocess.CompletedProcess(cmd, 0, stdout=_claude_json("claude response\n") + "\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    llm = SubscriptionCLIChatModel(
-        provider="claude-code",
-        model="sonnet",
-        command="claude",
-        workdir=str(tmp_path),
-    )
 
-    result = llm.invoke("hello")
+    result = _claude(tmp_path).invoke("hello")
 
     assert result.content == "claude response"
 
@@ -132,6 +152,69 @@ def test_oversized_system_prompt_moves_to_stdin(monkeypatch, tmp_path):
 
     assert huge not in calls[0]["cmd"]
     assert calls[0]["input"].startswith(f"[system]\n{huge}")
+
+
+@pytest.mark.parametrize(
+    "process",
+    [
+        # Current CLI: an error result on stdout, non-zero exit.
+        subprocess.CompletedProcess([], 1, stdout=_claude_json(USAGE_LIMIT_NOTICE, is_error=True, status=429), stderr=""),
+        # Flagged as an error but exiting 0.
+        subprocess.CompletedProcess([], 0, stdout=_claude_json(USAGE_LIMIT_NOTICE, is_error=True), stderr=""),
+        # Plain-text notice instead of JSON (older CLIs).
+        subprocess.CompletedProcess([], 1, stdout="", stderr="Claude AI usage limit reached|1757901600\n"),
+        # Notice returned as if it were the answer.
+        subprocess.CompletedProcess([], 0, stdout=_claude_json(USAGE_LIMIT_NOTICE), stderr=""),
+    ],
+)
+def test_used_up_subscription_raises_usage_limit_error(monkeypatch, tmp_path, process):
+    _fake_cli(monkeypatch, [process])
+
+    with pytest.raises(SubscriptionUsageLimitError):
+        _claude(tmp_path).invoke("analyze AAPL")
+
+
+def test_usage_limit_error_keeps_the_reset_time(monkeypatch, tmp_path):
+    _fake_cli(monkeypatch, [subprocess.CompletedProcess([], 1, stdout=_claude_json(USAGE_LIMIT_NOTICE, is_error=True), stderr="")])
+
+    with pytest.raises(SubscriptionUsageLimitError, match="resets 4am"):
+        _claude(tmp_path).invoke("analyze AAPL")
+
+
+@pytest.mark.parametrize(
+    "process",
+    [
+        subprocess.CompletedProcess([], 1, stdout=_claude_json("API Error: 500 Internal server error", is_error=True, status=500), stderr=""),
+        subprocess.CompletedProcess([], 1, stdout=_claude_json("Server is temporarily limiting requests (not your usage limit)", is_error=True, status=429), stderr=""),
+        subprocess.CompletedProcess([], 1, stdout="", stderr="Not logged in"),
+        subprocess.CompletedProcess([], 0, stdout=_claude_json(""), stderr=""),
+    ],
+)
+def test_other_failures_are_ordinary_cli_errors(monkeypatch, tmp_path, process):
+    _fake_cli(monkeypatch, [process])
+
+    with pytest.raises(SubscriptionCLIError) as raised:
+        _claude(tmp_path).invoke("analyze AAPL")
+
+    assert not isinstance(raised.value, SubscriptionUsageLimitError)
+
+
+def test_long_answer_mentioning_a_limit_is_not_a_usage_limit(monkeypatch, tmp_path):
+    report = "You've reached your target allocation in AAPL.\n" + "Details. " * 200
+    _fake_cli(monkeypatch, [report])
+
+    assert _claude(tmp_path).invoke("analyze AAPL").content == report.strip()
+
+
+def test_structured_agent_does_not_retry_after_usage_limit(monkeypatch, tmp_path):
+    limit = subprocess.CompletedProcess([], 1, stdout=_claude_json(USAGE_LIMIT_NOTICE, is_error=True), stderr="")
+    calls = _fake_cli(monkeypatch, [limit, "free-text answer"])
+    llm = _claude(tmp_path)
+
+    with pytest.raises(SubscriptionUsageLimitError):
+        invoke_structured_or_freetext(llm.with_structured_output(Rating), llm, "rate NVDA", str, "Portfolio Manager")
+
+    assert len(calls) == 1
 
 
 def test_bound_tools_are_described_and_json_reply_becomes_tool_call(monkeypatch, tmp_path):
@@ -195,26 +278,11 @@ def test_analyst_tool_loop_feeds_real_tool_results_back(monkeypatch, tmp_path):
 
 
 def test_subscription_structured_output_parses_pydantic(monkeypatch, tmp_path):
-    def fake_run(cmd, input, text, capture_output, timeout, check, cwd):
-        assert "JSON Schema" in input
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout='{"rating":"buy","confidence":87}',
-            stderr="",
-        )
+    calls = _fake_cli(monkeypatch, ['{"rating":"buy","confidence":87}'])
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    llm = SubscriptionCLIChatModel(
-        provider="claude-code",
-        model="sonnet",
-        command="claude",
-        workdir=str(tmp_path),
-    )
+    result = _claude(tmp_path).with_structured_output(Rating).invoke("rate NVDA")
 
-    structured = llm.with_structured_output(Rating)
-    result = structured.invoke("rate NVDA")
-
+    assert "JSON Schema" in calls[0]["input"]
     assert result == Rating(rating="buy", confidence=87)
 
 

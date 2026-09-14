@@ -33,6 +33,11 @@ per ticker — start with a short list.
 Only one review runs at a time: a second launch exits while another holds
 <results_dir>/portfolio_review.lock.
 
+When a Claude subscription runs out of usage, a run with --window waits and
+retries the same ticker every 15 minutes while there is still time in the
+window; a run without one stops. Either way the tickers not analyzed are
+listed as skipped rather than failing one by one.
+
 Progress is printed as it happens (one line per model call with the
 subscription CLI providers, plus a heartbeat every minute) and kept in
 <results_dir>/progress.json while the run lasts. The summary is written to
@@ -49,6 +54,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import IO
@@ -66,6 +72,10 @@ from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
 
 HEARTBEAT_SECONDS = 60
 STEP_LOGGER = "tradingagents.llm_clients.subscription_client"
+USAGE_LIMIT_RETRY = datetime.timedelta(minutes=15)
+# Before any ticker has finished, assume one takes this long when deciding
+# whether a wait for the usage limit still leaves time to analyze.
+ASSUMED_TICKER_RUN = datetime.timedelta(minutes=10)
 
 
 def acquire_run_lock(path: Path) -> tuple[IO[str] | None, str]:
@@ -143,6 +153,25 @@ def window_block_reason(
     if now + longest_run > window_end:
         return f"not enough time left before {end:%H:%M} (a ticker takes up to {longest_run})"
     return None
+
+
+def usage_limit_retry_at(
+    window: tuple[datetime.time, datetime.time] | None,
+    now: datetime.datetime,
+    longest_run: datetime.timedelta,
+) -> datetime.datetime | None:
+    """When to retry a ticker after the Claude usage limit ran out, or None to stop.
+
+    Only a scheduled run (one with a window) waits, and only while a ticker
+    started at the retry time would still finish inside the window. A manual
+    run stops at once rather than sitting idle for hours.
+    """
+    if window is None:
+        return None
+    retry_at = now + USAGE_LIMIT_RETRY
+    if window_block_reason(window, retry_at, max(longest_run, ASSUMED_TICKER_RUN)):
+        return None
+    return retry_at
 
 
 def minutes_since(stamp: str) -> int:
@@ -224,6 +253,7 @@ def main() -> int:
     # Imported after the lock: loading the graph takes a while on a Pi.
     from cli.utils import detect_asset_type
     from tradingagents.graph.trading_graph import TradingAgentsGraph
+    from tradingagents.llm_clients.subscription_client import SubscriptionUsageLimitError
 
     ta = TradingAgentsGraph(debug=False, config=config)
 
@@ -240,8 +270,10 @@ def main() -> int:
     results: list[tuple[str, str]] = []
     longest_run = datetime.timedelta(0)
     failed = False
+    i = 0
     try:
-        for i, ticker in enumerate(tickers):
+        while i < len(tickers):
+            ticker = tickers[i]
             if args.window:
                 reason = window_block_reason(args.window, datetime.datetime.now(), longest_run)
                 if reason:
@@ -254,18 +286,32 @@ def main() -> int:
             progress.update(ticker=ticker, index=i + 1, ticker_started=started.isoformat(timespec="seconds"), step=None, reply=None)
             try:
                 _, decision = ta.propagate(ticker, args.date, asset_type=asset_type)
+            except SubscriptionUsageLimitError as exc:
+                # Every later ticker would fail the same way until the limit
+                # resets: wait for it or stop, never burn through the list.
+                print(f"  {exc}", flush=True)
+                retry_at = usage_limit_retry_at(args.window, datetime.datetime.now(), longest_run)
+                if retry_at is None:
+                    print(f"\nStopping: Claude usage limit reached. Skipped: {', '.join(tickers[i:])}", flush=True)
+                    results.extend((t, "SKIPPED (Claude usage limit reached)") for t in tickers[i:])
+                    failed = True
+                    break
+                print(f"  Waiting for the usage limit to reset; retrying {ticker} at {retry_at:%H:%M}", flush=True)
+                progress.update(step="waiting for the Claude usage limit to reset", reply=f"{exc} (retry at {retry_at:%H:%M})")
+                time.sleep(max(0.0, (retry_at - datetime.datetime.now()).total_seconds()))
+                continue
             except Exception as exc:  # noqa: BLE001 - keep going, report every ticker
                 print(f"  ERROR: {exc}", flush=True)
                 traceback.print_exc()
-                results.append((ticker, f"ERROR: {exc}"))
+                decision = f"ERROR: {exc}"
                 failed = True
-                continue
-            finally:
+            else:
                 took = datetime.datetime.now() - started
-                longest_run = max(longest_run, took)
-                progress.update(done=i + 1)
-            print(f"  Decision: {decision} (took {int(took.total_seconds() // 60)}m)", flush=True)
+                print(f"  Decision: {decision} (took {int(took.total_seconds() // 60)}m)", flush=True)
+            longest_run = max(longest_run, datetime.datetime.now() - started)
+            progress.update(done=i + 1)
             results.append((ticker, decision))
+            i += 1
     finally:
         progress.finish()
 
