@@ -7,11 +7,18 @@ WorkingDirectory=/home/pi/apps/TradingAgents
 # The user manager's PATH lacks ~/.local/bin, where the claude CLI lives.
 Environment=CLAUDE_CODE_COMMAND=/home/pi/.local/bin/claude
 Environment=PYTHONUNBUFFERED=1
-# Refresh portfolio.txt from eToro first; "-" keeps the review running on the
-# last synced list if eToro is unreachable.
+# "-" keeps the night's other steps running when one of these fails.
+# Refresh holdings and the account snapshot from eToro, then pick buy candidates.
 ExecStartPre=-/home/pi/apps/TradingAgents/.venv/bin/python scripts/sync_etoro_portfolio.py
-ExecStart=/home/pi/apps/TradingAgents/.venv/bin/python scripts/portfolio_review.py --file portfolio.txt --window 02:00-06:00
-# Hard stop at 06:00 for the 02:00 start; the script already stops starting
+ExecStartPre=-/home/pi/apps/TradingAgents/.venv/bin/python scripts/find_buy_candidates.py
+ExecStart=/home/pi/apps/TradingAgents/.venv/bin/python scripts/portfolio_review.py --file portfolio.txt --file candidates.txt --window 02:00-06:00
+# With fresh ratings: value the account and check stops (changed on eToro only
+# when ETORO_AUTO_APPLY_STOPS=true in .env), then look for leveraged setups.
+ExecStopPost=-/home/pi/apps/TradingAgents/.venv/bin/python scripts/etoro_account.py
+ExecStopPost=-/home/pi/apps/TradingAgents/.venv/bin/python scripts/find_leveraged_setups.py
+# Hard stop at 06:00 for the 02:00 start; the review already stops starting
 # tickers that wouldn't finish in time, so this only catches a stuck run.
 TimeoutStartSec=4h
+# The post-review steps only fetch prices; give them room on a slow Pi.
+TimeoutStopSec=15min
 Nice=10

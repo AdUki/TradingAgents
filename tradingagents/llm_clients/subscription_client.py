@@ -1,12 +1,15 @@
 """LangChain chat wrappers for subscription-backed local AI CLIs.
 
 These providers let users who are authenticated in Codex CLI or Claude Code
-run TradingAgents without separate OpenAI/Anthropic API keys. They are a
-best-effort compatibility layer: calls are executed by spawning the local CLI
-for each LangChain invocation, so they are slower than API providers and do not
-support native tool-calling. TradingAgents still works because analyst nodes
-fall back to plain text when no tool calls are returned, and structured agents
-use prompt-constrained JSON parsing.
+run TradingAgents without separate OpenAI/Anthropic API keys. Each LangChain
+invocation spawns the local CLI, so they are slower than API providers.
+
+The CLIs have no native LangChain tool calling, so it is emulated: bound tools
+are described in the system prompt, the model replies with a JSON
+``tool_calls`` object when it needs data, and that reply becomes a LangChain
+tool call the graph's ToolNode executes. Without this, analysts never fetch
+market data and write reports from nothing. Structured agents use
+prompt-constrained JSON parsing.
 """
 
 from __future__ import annotations
@@ -17,30 +20,37 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Optional
+import uuid
+from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    convert_to_messages,
+)
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
-from pydantic import BaseModel, ConfigDict, Field
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from pydantic import BaseModel, ConfigDict
 
 from .base_client import BaseLLMClient
 from .validators import validate_model
 
+# Linux rejects a single argv string over 128 KiB; larger system prompts go
+# through stdin instead of --system-prompt.
+_MAX_SYSTEM_PROMPT_ARG_BYTES = 100_000
+
+# Replaces Claude Code's coding-agent system prompt when the caller sends none,
+# so the model never answers as a coding assistant reviewing "a prompt template".
+_DEFAULT_SYSTEM_PROMPT = "You are an assistant working inside the TradingAgents trading-research application."
+
 
 class SubscriptionCLIError(RuntimeError):
     """Raised when a subscription-backed CLI cannot produce a response."""
-
-
-def _message_role(message: BaseMessage) -> str:
-    role = getattr(message, "type", "message")
-    return {
-        "human": "user",
-        "ai": "assistant",
-        "system": "system",
-        "tool": "tool",
-    }.get(role, role)
 
 
 def _stringify_content(content: Any) -> str:
@@ -59,22 +69,52 @@ def _stringify_content(content: Any) -> str:
     return str(content)
 
 
-def _input_to_prompt(input_: Any) -> str:
+def _to_messages(input_: Any) -> list[BaseMessage]:
     if isinstance(input_, str):
-        return input_
+        return [HumanMessage(content=input_)]
     if hasattr(input_, "to_messages"):
-        input_ = input_.to_messages()
+        return input_.to_messages()
     if isinstance(input_, list):
-        lines: list[str] = []
-        for message in input_:
-            if isinstance(message, BaseMessage):
-                role = _message_role(message)
-                content = _stringify_content(message.content)
-                lines.append(f"[{role}]\n{content}")
-            else:
-                lines.append(str(message))
-        return "\n\n".join(lines)
-    return str(input_)
+        return convert_to_messages(input_)
+    return [HumanMessage(content=str(input_))]
+
+
+def _render_transcript(messages: list[BaseMessage]) -> str:
+    """Flatten a conversation, including tool calls and their results, to text."""
+    blocks: list[str] = []
+    for message in messages:
+        content = _stringify_content(message.content)
+        if isinstance(message, ToolMessage):
+            name = f" {message.name}" if message.name else ""
+            blocks.append(f"[tool result{name} for call {message.tool_call_id}]\n{content}")
+        elif isinstance(message, AIMessage):
+            calls = [{"id": c["id"], "name": c["name"], "args": c["args"]} for c in message.tool_calls]
+            if calls:
+                envelope = json.dumps({"tool_calls": calls}, ensure_ascii=False)
+                content = f"{content}\n{envelope}" if content else envelope
+            blocks.append(f"[assistant]\n{content}")
+        else:
+            role = {"human": "user", "system": "system"}.get(message.type, message.type)
+            blocks.append(f"[{role}]\n{content}")
+    return "\n\n".join(blocks)
+
+
+def _tool_spec(tool: Any) -> dict[str, Any]:
+    return convert_to_openai_tool(tool)["function"]
+
+
+def _tool_protocol(tools: tuple[Any, ...]) -> str:
+    specs = [_tool_spec(tool) for tool in tools]
+    return (
+        "# Tools\n"
+        "You can use the tools below, but you cannot run them yourself. To call tools, reply "
+        "with ONLY this JSON object and nothing else (no prose, no code fences):\n"
+        '{"tool_calls": [{"name": "<tool name>", "args": {<arguments>}}]}\n'
+        "You may request several tools in one reply. Their results come back to you as "
+        "[tool result ...] messages. Never say a tool is unavailable: request it. Once you have "
+        "the data you need, reply with your final answer as plain text, not JSON.\n"
+        f"Available tools (JSON Schema):\n{json.dumps(specs, ensure_ascii=False, indent=1)}"
+    )
 
 
 def _schema_json(schema: Any) -> str:
@@ -87,11 +127,16 @@ def _schema_json(schema: Any) -> str:
     return json.dumps(schema, indent=2, default=str)
 
 
-def _extract_json(text: str) -> Any:
+def _strip_code_fence(text: str) -> str:
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    return cleaned
+
+
+def _extract_json(text: str) -> Any:
+    cleaned = _strip_code_fence(text)
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
@@ -137,6 +182,33 @@ def _json_candidates(text: str) -> list[str]:
     return candidates
 
 
+def _parse_tool_calls(text: str, tool_names: set[str]) -> list[dict[str, Any]] | None:
+    """Tool calls requested by a reply, or None when it is a final answer.
+
+    Only a ``tool_calls`` object whose every call names a bound tool counts, so
+    a report that merely quotes some JSON stays a final answer.
+    """
+    cleaned = _strip_code_fence(text)
+    for candidate in [cleaned, *_json_candidates(cleaned)]:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("tool_calls"), list):
+            continue
+        calls = [call for call in payload["tool_calls"] if isinstance(call, dict)]
+        if calls and all(call.get("name") in tool_names for call in calls):
+            return [
+                {
+                    "name": call["name"],
+                    "args": call["args"] if isinstance(call.get("args"), dict) else {},
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                }
+                for call in calls
+            ]
+    return None
+
+
 class SubscriptionCLIChatModel(BaseChatModel):
     """Chat model that shells out to Codex CLI or Claude Code."""
 
@@ -144,8 +216,9 @@ class SubscriptionCLIChatModel(BaseChatModel):
     model: str
     command: str
     timeout: int = 600
-    workdir: Optional[str] = None
-    model_config = ConfigDict(extra="allow")
+    workdir: str | None = None
+    bound_tools: tuple[Any, ...] = ()
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
     @property
     def _llm_type(self) -> str:
@@ -159,28 +232,24 @@ class SubscriptionCLIChatModel(BaseChatModel):
             "command": self.command,
         }
 
-    def bind_tools(self, tools: Any, **kwargs: Any):
-        """Return self because subscription CLIs do not expose LangChain tool calls.
-
-        TradingAgents analyst nodes handle the no-tool-call case by using the
-        returned text as that analyst's report. The prompt still lists the tool
-        names, but the local CLI is not allowed to execute arbitrary project
-        tools on the framework's behalf.
-        """
-        return self
+    def bind_tools(self, tools: Any, **kwargs: Any) -> SubscriptionCLIChatModel:
+        return self.model_copy(update={"bound_tools": tuple(tools)})
 
     def with_structured_output(self, schema: Any, **kwargs: Any):
         schema_text = _schema_json(schema)
 
         def invoke(input_: Any):
-            prompt = _input_to_prompt(input_)
-            structured_prompt = (
-                f"{prompt}\n\n"
-                "Return only valid JSON that conforms to this JSON Schema. "
-                "Do not include markdown fences or explanatory prose.\n"
-                f"JSON Schema:\n{schema_text}"
-            )
-            message = self.invoke(structured_prompt)
+            messages = [
+                *_to_messages(input_),
+                HumanMessage(
+                    content=(
+                        "Return only valid JSON that conforms to this JSON Schema. "
+                        "Do not include markdown fences or explanatory prose.\n"
+                        f"JSON Schema:\n{schema_text}"
+                    )
+                ),
+            ]
+            message = self.invoke(messages)
             parsed = _extract_json(message.content)
             if isinstance(schema, type) and issubclass(schema, BaseModel):
                 return schema.model_validate(parsed)
@@ -191,26 +260,37 @@ class SubscriptionCLIChatModel(BaseChatModel):
     def _generate(
         self,
         messages: list[BaseMessage],
-        stop: Optional[list[str]] = None,
+        stop: list[str] | None = None,
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
-        prompt = _input_to_prompt(messages)
+        system = "\n\n".join(
+            _stringify_content(m.content) for m in messages if isinstance(m, SystemMessage)
+        )
+        if self.bound_tools:
+            system = f"{system}\n\n{_tool_protocol(self.bound_tools)}".strip()
+        prompt = _render_transcript([m for m in messages if not isinstance(m, SystemMessage)])
         if stop:
             prompt += "\n\nStop sequences to respect: " + ", ".join(stop)
-        content = self._run_cli(prompt)
-        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
-    def _run_cli(self, prompt: str) -> str:
+        content = self._run_cli(system, prompt)
+
+        tool_calls = None
+        if self.bound_tools:
+            tool_calls = _parse_tool_calls(content, {_tool_spec(t)["name"] for t in self.bound_tools})
+        message = AIMessage(content="", tool_calls=tool_calls) if tool_calls else AIMessage(content=content)
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def _run_cli(self, system: str, prompt: str) -> str:
         if self.provider == "codex-cli":
-            return self._run_codex(prompt)
+            return self._run_codex(f"[system]\n{system}\n\n{prompt}" if system else prompt)
         if self.provider == "claude-code":
-            return self._run_claude(prompt)
+            return self._run_claude(system, prompt)
         raise SubscriptionCLIError(f"Unsupported subscription CLI provider: {self.provider}")
 
     def _run_codex(self, prompt: str) -> str:
-        temp_file = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
-        temp_file.close()
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as temp_file:
+            pass
         try:
             cmd = [
                 self.command,
@@ -224,7 +304,7 @@ class SubscriptionCLIChatModel(BaseChatModel):
                 cmd.extend(["-m", self.model])
             cmd.extend(["-o", temp_file.name, "-"])
             self._run_subprocess(cmd, prompt)
-            with open(temp_file.name, "r", encoding="utf-8") as output:
+            with open(temp_file.name, encoding="utf-8") as output:
                 text = output.read().strip()
         finally:
             if os.path.exists(temp_file.name):
@@ -233,16 +313,27 @@ class SubscriptionCLIChatModel(BaseChatModel):
             raise SubscriptionCLIError("Codex CLI completed but produced no final message")
         return text
 
-    def _run_claude(self, prompt: str) -> str:
+    def _run_claude(self, system: str, prompt: str) -> str:
         cmd = [
             self.command,
             "--print",
             "--output-format",
             "text",
             "--no-session-persistence",
+            # The model plays a TradingAgents role, not a coding agent: no Claude
+            # Code tools or MCP servers (data tools are emulated above).
+            "--tools",
+            "",
+            "--strict-mcp-config",
         ]
         if self.model and self.model != "default":
             cmd.extend(["--model", self.model])
+        system = system or _DEFAULT_SYSTEM_PROMPT
+        if len(system.encode()) <= _MAX_SYSTEM_PROMPT_ARG_BYTES:
+            cmd.extend(["--system-prompt", system])
+        else:
+            cmd.extend(["--system-prompt", _DEFAULT_SYSTEM_PROMPT])
+            prompt = f"[system]\n{system}\n\n{prompt}"
         result = self._run_subprocess(cmd, prompt)
         text = result.stdout.strip()
         if not text:
@@ -278,7 +369,7 @@ class SubscriptionCLIChatModel(BaseChatModel):
 class SubscriptionCLIClient(BaseLLMClient):
     """Client for subscription-backed local CLIs such as Codex and Claude Code."""
 
-    def __init__(self, model: str, base_url: Optional[str] = None, provider: str = "codex-cli", **kwargs):
+    def __init__(self, model: str, base_url: str | None = None, provider: str = "codex-cli", **kwargs):
         super().__init__(model, base_url, **kwargs)
         self.provider = provider.lower()
 

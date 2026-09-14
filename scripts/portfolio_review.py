@@ -15,8 +15,9 @@ Usage:
     # tickers as arguments
     scripts/portfolio_review.py AAPL TSLA BTC-USD
 
-    # or from another file, one ticker per line (# comments allowed)
-    scripts/portfolio_review.py --file my_portfolio.txt
+    # or from files, one ticker per line (# comments allowed); repeatable,
+    # analyzed in order
+    scripts/portfolio_review.py --file portfolio.txt --file candidates.txt
 
     # pin the analysis date (defaults to today)
     scripts/portfolio_review.py AAPL TSLA --date 2026-09-01
@@ -38,6 +39,7 @@ import argparse
 import datetime
 import os
 import sys
+import traceback
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,8 +58,13 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph  # noqa: E402
 
 def load_tickers(args: argparse.Namespace) -> list[str]:
     tickers = list(args.tickers)
-    if args.file:
-        with open(args.file) as f:
+    for path in args.file or []:
+        if not Path(path).exists():
+            # A missing optional list (e.g. candidates.txt before its first
+            # sync) must not cancel the review of the others.
+            print(f"Skipping missing ticker file {path}", flush=True)
+            continue
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
@@ -106,13 +113,13 @@ def window_block_reason(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("tickers", nargs="*", help="Tickers to analyze, e.g. AAPL TSLA BTC-USD")
-    parser.add_argument("--file", help=f"Path to a file with one ticker per line (default: {DEFAULT_PORTFOLIO} when no tickers are given)")
+    parser.add_argument("--file", action="append", help=f"File with one ticker per line; repeatable (default: {DEFAULT_PORTFOLIO} when no tickers are given)")
     parser.add_argument("--date", default=datetime.date.today().isoformat(), help="Analysis date, YYYY-MM-DD (default: today)")
     parser.add_argument("--window", type=parse_window, help="Only start tickers inside this local-time window, e.g. 02:00-06:00")
     args = parser.parse_args()
 
     if not args.tickers and not args.file and DEFAULT_PORTFOLIO.exists():
-        args.file = str(DEFAULT_PORTFOLIO)
+        args.file = [str(DEFAULT_PORTFOLIO)]
     tickers = load_tickers(args)
     if not tickers:
         parser.error(f"no tickers given — pass them as arguments, via --file, or list them in {DEFAULT_PORTFOLIO}")
@@ -137,6 +144,7 @@ def main() -> int:
             _, decision = ta.propagate(ticker, args.date, asset_type=asset_type)
         except Exception as exc:  # noqa: BLE001 - keep going, report every ticker
             print(f"  ERROR: {exc}", flush=True)
+            traceback.print_exc()
             results.append((ticker, f"ERROR: {exc}"))
             failed = True
             continue
