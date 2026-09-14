@@ -28,6 +28,15 @@ def create_llm_client(
     """
     provider_lower = provider.lower()
 
+    # Local, testing-only: routes through a subscription-authenticated CLI
+    # (claude-code / codex-cli) instead of a metered API key. Ported from
+    # https://github.com/TauricResearch/TradingAgents/pull/812 — the upstream
+    # maintainer has declined this class of integration, so it isn't part of
+    # supported main; kept here only for local use.
+    if provider_lower in ("codex-cli", "claude-code"):
+        from .subscription_client import SubscriptionCLIClient
+        return SubscriptionCLIClient(model, base_url, provider=provider_lower, **kwargs)
+
     # Native (non-OpenAI) APIs are matched first so their string check doesn't
     # import the OpenAI client. Everything else is OpenAI-compatible and routes
     # through the provider registry (single source of truth).

@@ -205,6 +205,30 @@ MODEL_OPTIONS: ProviderModeOptions = {
     "nvidia": _CUSTOM_ONLY,
     # Bedrock model IDs / cross-region inference profile IDs are user-specified.
     "bedrock": _CUSTOM_ONLY,
+    # Local, testing-only subscription CLIs (see llm_clients/subscription_client.py).
+    # Model names are passed straight through to the CLI's own model flag.
+    "codex-cli": {
+        "quick": [
+            ("Codex CLI configured default", "default"),
+            ("Custom model ID", "custom"),
+        ],
+        "deep": [
+            ("Codex CLI configured default", "default"),
+            ("Custom model ID", "custom"),
+        ],
+    },
+    "claude-code": {
+        "quick": [
+            ("Claude Sonnet subscription alias", "sonnet"),
+            ("Claude Haiku subscription alias", "haiku"),
+            ("Custom model ID", "custom"),
+        ],
+        "deep": [
+            ("Claude Opus subscription alias", "opus"),
+            ("Claude Sonnet subscription alias", "sonnet"),
+            ("Custom model ID", "custom"),
+        ],
+    },
 }
 
 

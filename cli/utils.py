@@ -363,6 +363,10 @@ def _llm_provider_table() -> list[tuple[str, str, str | None]]:
         ("Amazon Bedrock", "bedrock", None),
         ("Ollama", "ollama", ollama_url),
         ("OpenAI-compatible (vLLM, LM Studio, llama.cpp, custom relay)", "openai_compatible", None),
+        # Local, testing-only: routes through a subscription-authenticated CLI
+        # instead of a metered key. Not upstream-supported (see factory.py).
+        ("Codex CLI subscription (local, unofficial)", "codex-cli", None),
+        ("Claude Code subscription (local, unofficial)", "claude-code", None),
     ]
 
 
