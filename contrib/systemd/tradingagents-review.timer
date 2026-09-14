@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the TradingAgents portfolio review at 02:00 after each trading day
+
+[Timer]
+# Tue-Sat: each run follows a Mon-Fri market close; weekend nights would
+# re-analyze unchanged prices and spend tokens for nothing.
+OnCalendar=Tue..Sat *-*-* 02:00:00
+AccuracySec=1min
+# No Persistent=: a night missed while the Pi was off is skipped rather than
+# caught up at boot, outside the 02:00-06:00 window.
+
+[Install]
+WantedBy=timers.target
