@@ -1,14 +1,15 @@
 """Reddit search fetcher for ticker-specific discussion posts.
 
-Default path is Reddit's public Atom/RSS search feed
-(``reddit.com/r/{sub}/search.rss``). The richer JSON search endpoint
-(``/search.json``) is reliably WAF-blocked (``HTTP 403``) for public clients
-(issue #862), and probing it on every call only doubled our request volume
-against Reddit's per-IP rate limit — tripping ``429`` on the RSS fallback — so
-it is kept (``_fetch_subreddit_json``) but not used by default. On a 429 we back
-off once (honouring ``Retry-After``). RSS lacks score / comment counts, so those
-posts are marked and the formatter omits the metrics rather than printing fake
-zeros.
+Default path is Reddit's public Atom/RSS search feed. All subreddits are
+searched with one combined request (``reddit.com/r/a+b+c/search.rss``) and the
+entries are grouped back per subreddit by their Atom ``<category>``: the feed
+allows roughly one request per minute per IP, so a request per subreddit
+guaranteed a 429 (and a ~60s back-off) on every subreddit after the first. The
+richer JSON search endpoint (``/search.json``) is reliably WAF-blocked
+(``HTTP 403``) for public clients (issue #862), so it is kept
+(``_fetch_subreddit_json``) but not used by default. On a 429 we back off once
+(honouring ``Retry-After``). RSS lacks score / comment counts, so those posts are
+marked and the formatter omits the metrics rather than printing fake zeros.
 
 A fetch that fails is reported as ``<unavailable>``, never as "no posts found":
 the two are different claims, and passing a rate-limited fetch off as silence
@@ -73,6 +74,9 @@ _ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 # investing trend more measured. Caller can override.
 DEFAULT_SUBREDDITS = ("wallstreetbets", "stocks", "investing")
 
+# Reddit's maximum page size; one combined search page is split across subreddits.
+_COMBINED_SEARCH_LIMIT = 100
+
 
 def _search_qs(ticker: str, limit: int) -> str:
     return urlencode({
@@ -109,15 +113,15 @@ def _strip_html(content: str) -> str:
 # Headerless-429 backoff when Reddit gives no Retry-After. Measured against
 # /r/{sub}/search.rss, a retry still 429s at 8s, 10s and 30s of spacing and
 # succeeds at 60s, so a shorter wait spends the one retry on a request that
-# cannot succeed (#1295). Jittered so several analyses sharing an IP don't
-# retry in lockstep and re-collide on the limit.
+# cannot succeed (#1295). Jittered upward only, so several analyses sharing an
+# IP don't retry in lockstep and no retry fires before the measured 60s.
 _RETRY_FALLBACK_SECONDS = 60.0
 
 
 def _jitter(seconds: float, frac: float = 0.2) -> float:
-    """Return ``seconds`` with +/-``frac`` random jitter, to desynchronize
-    concurrent runs pacing against the same per-IP limit."""
-    return seconds * (1.0 + random.uniform(-frac, frac))
+    """Return ``seconds`` plus up to ``frac`` random jitter (never less), to
+    desynchronize concurrent runs without undercutting a measured minimum."""
+    return seconds * (1.0 + random.uniform(0.0, frac))
 
 
 def _retry_after_seconds(exc: HTTPError) -> float | None:
@@ -163,6 +167,9 @@ def _fetch_subreddit_rss(
 ) -> list[dict] | None:
     """Default path: parse the public Atom search feed for a subreddit.
 
+    ``sub`` may be a ``+``-joined multireddit; each post is tagged with the
+    subreddit named in its Atom ``<category>``, falling back to ``sub``.
+
     Carries no score / comment counts, so those fields are left None and the
     post is tagged ``source="rss"`` for honest display. On a 429 (Reddit's
     per-IP rate limit) we back off once — honouring ``Retry-After`` when
@@ -203,6 +210,7 @@ def _fetch_subreddit_rss(
         title_el = entry.find("atom:title", _ATOM_NS)
         published_el = entry.find("atom:published", _ATOM_NS)
         content_el = entry.find("atom:content", _ATOM_NS)
+        category_el = entry.find("atom:category", _ATOM_NS)
         posts.append({
             "title": (title_el.text if title_el is not None else "") or "",
             "score": None,
@@ -212,6 +220,7 @@ def _fetch_subreddit_rss(
             ),
             "selftext": _strip_html(content_el.text if content_el is not None else ""),
             "source": "rss",
+            "subreddit": (category_el.get("term") if category_el is not None else None) or sub,
         })
     return posts
 
@@ -250,15 +259,14 @@ def _fetch_subreddit(
     sub: str,
     limit: int,
     timeout: float,
-    _retry: bool = True,
 ) -> list[dict] | None:
-    """Fetch one subreddit, RSS-first. ``None`` means the fetch failed.
+    """Fetch a subreddit (or ``+``-joined multireddit), RSS-first. ``None``
+    means the fetch failed.
 
     The JSON search endpoint is reliably WAF-blocked (403) for public clients,
-    so we go straight to the RSS feed — which serves our identified User-Agent
-    reliably — halving our request volume against Reddit's per-IP rate limit.
+    so we go straight to the RSS feed, which serves our identified User-Agent.
     """
-    return _fetch_subreddit_rss(ticker, sub, limit, timeout, _retry=_retry)
+    return _fetch_subreddit_rss(ticker, sub, limit, timeout)
 
 
 def fetch_reddit_posts(
@@ -266,16 +274,16 @@ def fetch_reddit_posts(
     subreddits: Iterable[str] = DEFAULT_SUBREDDITS,
     limit_per_sub: int = 5,
     timeout: float = 10.0,
-    inter_request_delay: float = 1.0,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> str:
     """Fetch recent Reddit posts mentioning ``ticker`` across finance
     subreddits and return them as a formatted plaintext block.
 
-    ``inter_request_delay`` paces the (now RSS-only) per-subreddit requests to
-    stay under Reddit's public per-IP rate limit; combined with the RSS-first
-    path it makes 429s rare even when several analyses run back-to-back.
+    All subreddits are searched with one combined request, since the RSS feed
+    allows about one request per minute per IP. The shared page of results is
+    split back per subreddit and capped at ``limit_per_sub`` each, so a very
+    high-volume subreddit can crowd quieter ones out of that page.
 
     When ``start_date``/``end_date`` (yyyy-mm-dd) are given, posts are trimmed to
     that window so a historical run does not leak current discussion into a
@@ -285,25 +293,24 @@ def fetch_reddit_posts(
     # ("BTC") so the query actually matches discussion instead of near-nothing.
     ticker = crypto_base(ticker) or ticker
     subreddits = list(subreddits)
+    fetched = _fetch_subreddit(ticker, "+".join(subreddits), _COMBINED_SEARCH_LIMIT, timeout)
+    if fetched is None:
+        # A failed fetch is not an absence of discussion, so it must not be
+        # rendered as "no posts found" (#1295).
+        return (
+            f"<Reddit unavailable: fetch failed for "
+            f"{', '.join(f'r/{s}' for s in subreddits)}; this is not an "
+            f"absence of discussion>"
+        )
+
+    # Window before capping, so posts newer than a historical window don't use
+    # up a subreddit's slots and push out the in-window ones.
+    windowed = _within_window(fetched, start_date, end_date)
     blocks = []
     total_posts = 0
-    unavailable = []
-    allow_retry = True
-    for i, sub in enumerate(subreddits):
-        if i > 0 and inter_request_delay:
-            time.sleep(_jitter(inter_request_delay))
-        fetched = _fetch_subreddit(ticker, sub, limit_per_sub, timeout, _retry=allow_retry)
-        if fetched is None:
-            # A failed fetch is not an absence of discussion, so it must not be
-            # rendered as "no posts found" (#1295). One failure also means the
-            # per-IP budget is likely gone, so skip the (now 60s) back-off on
-            # the remaining subreddits rather than stalling the run on retries
-            # that cannot succeed; #1286 tracks coordinating this properly.
-            allow_retry = False
-            unavailable.append(sub)
-            blocks.append(f"r/{sub}: <unavailable: fetch failed, not an absence of posts>")
-            continue
-        posts = _within_window(fetched, start_date, end_date)
+    for sub in subreddits:
+        posts = [p for p in windowed if (p.get("subreddit") or "").lower() == sub.lower()]
+        posts = posts[:limit_per_sub]
         total_posts += len(posts)
         if not posts:
             blocks.append(f"r/{sub}: <no posts found mentioning {ticker.upper()} in the past 7 days>")
@@ -336,23 +343,8 @@ def fetch_reddit_posts(
         blocks.append("\n".join(lines))
 
     if total_posts == 0:
-        searched = [s for s in subreddits if s not in unavailable]
-        if not searched:
-            # Every source failed: claiming "no posts" here would assert a
-            # silence we never observed.
-            return (
-                f"<Reddit unavailable: every source failed to fetch "
-                f"({', '.join(f'r/{s}' for s in unavailable)}); this is not an "
-                f"absence of discussion>"
-            )
-        summary = (
+        return (
             f"<no Reddit posts found mentioning {ticker.upper()} across "
-            f"{', '.join(f'r/{s}' for s in searched)} in the past 7 days>"
+            f"{', '.join(f'r/{s}' for s in subreddits)} in the past 7 days>"
         )
-        if unavailable:
-            summary += (
-                f"\n<unavailable (fetch failed): "
-                f"{', '.join(f'r/{s}' for s in unavailable)}>"
-            )
-        return summary
     return "\n\n".join(blocks)

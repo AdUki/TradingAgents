@@ -1,5 +1,6 @@
-"""Tests for the RSS-first Reddit fetcher, its 429 backoff, the opt-in JSON
-path's degradation (#862), and chunked-transfer error handling (#1024)."""
+"""Tests for the RSS-first Reddit fetcher, its single combined search request,
+its 429 backoff, the opt-in JSON path's degradation (#862), and chunked-transfer
+error handling (#1024)."""
 
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from tradingagents.dataflows import reddit
 _SAMPLE_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <entry>
+    <category term="stocks" label="r/stocks"/>
     <title>NVDA earnings beat, stock pops</title>
     <published>2026-05-20T14:30:00+00:00</published>
     <content type="html">&lt;!-- SC_OFF --&gt;&lt;div class="md"&gt;&lt;p&gt;Great &lt;b&gt;quarter&lt;/b&gt; for NVDA&amp;#39;s datacenter unit.&lt;/p&gt;&lt;/div&gt;&lt;!-- SC_ON --&gt;</content>
@@ -52,6 +54,16 @@ def _raise(exc):
     return _resp(_r)
 
 
+def _post(sub, title="NVDA pops", created="2026-05-20T14:30:00Z", **overrides):
+    post = {
+        "title": title, "score": None, "num_comments": None,
+        "created_utc": reddit._iso_to_timestamp(created),
+        "selftext": "", "source": "rss", "subreddit": sub,
+    }
+    post.update(overrides)
+    return post
+
+
 @pytest.mark.unit
 class TestIsoToTimestamp:
     def test_parses_offset_and_z(self):
@@ -86,6 +98,12 @@ class TestRssParsing:
         assert posts[0]["created_utc"] > 0
         assert "datacenter unit" in posts[0]["selftext"]
 
+    def test_tags_posts_with_category_subreddit_or_requested_sub(self):
+        with patch.object(reddit, "urlopen", return_value=_atom_resp()):
+            posts = reddit._fetch_subreddit_rss("NVDA", "wallstreetbets+stocks", 5, 5.0)
+        assert posts[0]["subreddit"] == "stocks"
+        assert posts[1]["subreddit"] == "wallstreetbets+stocks"
+
     def test_malformed_xml_reports_unavailable(self):
         with patch.object(reddit, "urlopen", return_value=_resp(lambda: b"<<not xml>>")):
             assert reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0) is None
@@ -97,8 +115,7 @@ class TestFetchSubredditIsRssFirst:
     the WAF-blocked JSON endpoint, which only burned rate-limit budget."""
 
     def test_delegates_to_rss_without_touching_json(self):
-        sentinel = [{"title": "x", "source": "rss", "score": None,
-                     "num_comments": None, "created_utc": None, "selftext": ""}]
+        sentinel = [_post("stocks", title="x")]
         with patch.object(reddit, "_fetch_subreddit_rss", return_value=sentinel) as rss, \
              patch.object(reddit, "urlopen",
                           side_effect=AssertionError("JSON endpoint must not be called")):
@@ -113,8 +130,7 @@ class TestJsonPathFallsBackToRss:
 
     def test_403_triggers_rss(self):
         err = HTTPError("url", 403, "Blocked", {}, None)
-        rss_posts = [{"title": "x", "source": "rss", "score": None,
-                      "num_comments": None, "created_utc": None, "selftext": ""}]
+        rss_posts = [_post("stocks", title="x")]
         with patch.object(reddit, "urlopen", side_effect=err), \
              patch.object(reddit, "_fetch_subreddit_rss", return_value=rss_posts) as rss:
             out = reddit._fetch_subreddit_json("NVDA", "stocks", 5, 5.0)
@@ -157,16 +173,17 @@ class TestRss429Backoff:
             reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0)
         slept.assert_called_once_with(0.0)
 
-    def test_headerless_429_fallback_is_jittered(self):
-        # No Retry-After -> our own ~5s fallback, jittered so concurrent runs
-        # don't retry in lockstep (kept within a tight band).
+    def test_headerless_429_fallback_is_jittered_never_below_60s(self):
+        # No Retry-After -> our own 60s fallback, jittered upward only: a retry
+        # sooner than 60s is measured to still 429, wasting the one retry.
         err = HTTPError("url", 429, "Too Many Requests", {}, None)
-        with patch.object(reddit, "urlopen", side_effect=[err, _atom_resp()]), \
-             patch.object(reddit.time, "sleep") as slept:
-            reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0)
-        slept.assert_called_once()
-        (wait,), _ = slept.call_args
-        assert 48.0 <= wait <= 72.0  # 60s +/-20% jitter
+        for _ in range(50):
+            with patch.object(reddit, "urlopen", side_effect=[err, _atom_resp()]), \
+                 patch.object(reddit.time, "sleep") as slept:
+                reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0)
+            slept.assert_called_once()
+            (wait,), _ = slept.call_args
+            assert 60.0 <= wait <= 72.0
 
 
 @pytest.mark.unit
@@ -194,28 +211,67 @@ class TestChunkedTransferErrorsHandled:
 
 
 @pytest.mark.unit
+class TestCombinedSearch:
+    """All subreddits share one request: the RSS feed allows ~1 request/minute
+    per IP, so a request per subreddit 429'd every subreddit after the first."""
+
+    def test_one_request_covers_every_subreddit(self):
+        calls = []
+
+        def record(t, sub, limit, timeout):
+            calls.append((sub, limit))
+            return []
+
+        with patch.object(reddit, "_fetch_subreddit", side_effect=record):
+            reddit.fetch_reddit_posts("NVDA", subreddits=("a", "b", "c"))
+        assert calls == [("a+b+c", reddit._COMBINED_SEARCH_LIMIT)]
+
+    def test_posts_grouped_and_capped_per_subreddit(self):
+        fetched = (
+            [_post("stocks", title=f"stocks post {i}") for i in range(7)]
+            + [_post("Investing", title="investing post")]
+            + [_post("other", title="unrequested post")]
+        )
+        with patch.object(reddit, "_fetch_subreddit", return_value=fetched):
+            out = reddit.fetch_reddit_posts(
+                "NVDA", subreddits=("stocks", "investing"), limit_per_sub=5
+            )
+        assert "r/stocks — 5 recent posts" in out
+        assert "stocks post 4" in out and "stocks post 5" not in out
+        assert "r/investing — 1 recent posts" in out
+        assert "unrequested post" not in out
+
+    def test_window_applied_before_per_subreddit_cap(self):
+        fetched = [
+            _post("stocks", title="too new 1", created="2026-05-25T12:00:00Z"),
+            _post("stocks", title="too new 2", created="2026-05-25T11:00:00Z"),
+            _post("stocks", title="in window 1", created="2026-05-16T12:00:00Z"),
+            _post("stocks", title="in window 2", created="2026-05-15T12:00:00Z"),
+        ]
+        with patch.object(reddit, "_fetch_subreddit", return_value=fetched):
+            out = reddit.fetch_reddit_posts(
+                "NVDA", subreddits=("stocks",), limit_per_sub=2,
+                start_date="2026-05-13", end_date="2026-05-20",
+            )
+        assert "in window 1" in out and "in window 2" in out
+        assert "too new" not in out
+
+
+@pytest.mark.unit
 class TestFormatterHandlesRssPosts:
     def test_rss_posts_omit_fake_counts_and_note_source(self):
-        rss_posts = [{
-            "title": "NVDA pops", "score": None, "num_comments": None,
-            "created_utc": reddit._iso_to_timestamp("2026-05-20T14:30:00Z"),
-            "selftext": "great quarter", "source": "rss",
-        }]
+        rss_posts = [_post("stocks", selftext="great quarter")]
         with patch.object(reddit, "_fetch_subreddit", return_value=rss_posts):
-            out = reddit.fetch_reddit_posts("NVDA", subreddits=("stocks",), inter_request_delay=0)
+            out = reddit.fetch_reddit_posts("NVDA", subreddits=("stocks",))
         assert "via RSS feed" in out
         assert "↑" not in out  # no fake score arrow
         assert "NVDA pops" in out
         assert "great quarter" in out
 
     def test_json_posts_still_show_counts(self):
-        json_posts = [{
-            "title": "NVDA pops", "score": 1234, "num_comments": 56,
-            "created_utc": reddit._iso_to_timestamp("2026-05-20T14:30:00Z"),
-            "selftext": "",
-        }]
+        json_posts = [_post("stocks", score=1234, num_comments=56, source=None)]
         with patch.object(reddit, "_fetch_subreddit", return_value=json_posts):
-            out = reddit.fetch_reddit_posts("NVDA", subreddits=("stocks",), inter_request_delay=0)
+            out = reddit.fetch_reddit_posts("NVDA", subreddits=("stocks",))
         assert "1234↑" in out
         assert "56c" in out
         assert "via RSS" not in out
@@ -233,7 +289,7 @@ class TestCryptoSearchTerm:
             return []
 
         with patch.object(reddit, "_fetch_subreddit", side_effect=fake_fetch):
-            reddit.fetch_reddit_posts(ticker, subreddits=("stocks",), inter_request_delay=0)
+            reddit.fetch_reddit_posts(ticker, subreddits=("stocks",))
         return seen["ticker"]
 
     def test_crypto_pair_searches_base(self):
@@ -252,53 +308,24 @@ class TestFailedFetchIsNotSilence:
     r/investing are silent"), which is a signal that was never observed.
     """
 
-    _POST = {
-        "title": "NVDA pops", "score": None, "num_comments": None,
-        "created_utc": reddit._iso_to_timestamp("2026-05-20T14:30:00Z"),
-        "selftext": "", "source": "rss",
-    }
+    def _run(self, fetched):
+        with patch.object(reddit, "_fetch_subreddit", return_value=fetched):
+            return reddit.fetch_reddit_posts("NVDA", subreddits=("s0", "s1"))
 
-    def _run(self, results):
-        """Drive fetch_reddit_posts with a per-subreddit result sequence."""
-        subs = tuple(f"s{i}" for i in range(len(results)))
-        with patch.object(reddit, "_fetch_subreddit", side_effect=list(results)):
-            return reddit.fetch_reddit_posts(
-                "NVDA", subreddits=subs, inter_request_delay=0
-            )
-
-    def test_failed_subreddit_is_marked_unavailable_not_empty(self):
-        out = self._run([None, [self._POST]])
-        assert "unavailable" in out
-        assert "no posts found" not in out.split("unavailable")[0]
-
-    def test_all_sources_failing_does_not_claim_no_posts(self):
-        out = self._run([None, None])
+    def test_failed_fetch_does_not_claim_no_posts(self):
+        out = self._run(None)
         assert "Reddit unavailable" in out
+        assert "r/s0" in out and "r/s1" in out
+        assert "no posts found" not in out
         assert "no Reddit posts found" not in out
 
-    def test_mixed_failure_and_empty_only_claims_silence_for_searched_subs(self):
-        # s0 failed, s1 genuinely returned nothing: the "no posts" claim must
-        # cover only s1, with s0 reported separately as unavailable.
-        out = self._run([None, []])
-        assert "r/s1" in out.split("unavailable (fetch failed)")[0]
-        assert "unavailable (fetch failed): r/s0" in out
-
     def test_genuine_empty_still_reports_no_posts(self):
-        out = self._run([[], []])
+        out = self._run([])
         assert "no Reddit posts found" in out
         assert "unavailable" not in out
 
-    def test_retry_is_not_spent_again_after_a_failure(self):
-        # The 60s back-off must be paid at most once per run, so subsequent
-        # subreddits are fetched with retry disabled rather than stalling.
-        seen = []
-
-        def record(t, sub, limit, timeout, _retry=True):
-            seen.append(_retry)
-            return None
-
-        with patch.object(reddit, "_fetch_subreddit", side_effect=record):
-            reddit.fetch_reddit_posts(
-                "NVDA", subreddits=("a", "b", "c"), inter_request_delay=0
-            )
-        assert seen == [True, False, False]
+    def test_quiet_subreddit_reported_empty_beside_active_one(self):
+        out = self._run([_post("s0")])
+        assert "NVDA pops" in out
+        assert "r/s1: <no posts found" in out
+        assert "Reddit unavailable" not in out

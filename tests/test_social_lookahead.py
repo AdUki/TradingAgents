@@ -100,10 +100,11 @@ def _epoch(date_str):
 
 @pytest.mark.unit
 def test_reddit_historical_window_excludes_recent(monkeypatch):
-    posts = [{"title": "NOW", "created_utc": _epoch("2026-08-30"), "source": "rss"}]
+    posts = [{"title": "NOW", "created_utc": _epoch("2026-08-30"), "source": "rss",
+              "subreddit": "stocks"}]
     monkeypatch.setattr(reddit, "_fetch_subreddit", lambda *a, **k: posts)
     out = reddit.fetch_reddit_posts(
-        "AAPL", subreddits=("stocks",), inter_request_delay=0,
+        "AAPL", subreddits=("stocks",),
         start_date="2026-05-01", end_date="2026-05-08",
     )
     assert "NOW" not in out
@@ -112,10 +113,11 @@ def test_reddit_historical_window_excludes_recent(monkeypatch):
 
 @pytest.mark.unit
 def test_reddit_live_window_keeps_in_range(monkeypatch):
-    posts = [{"title": "INRANGE", "created_utc": _epoch("2026-05-05"), "source": "rss"}]
+    posts = [{"title": "INRANGE", "created_utc": _epoch("2026-05-05"), "source": "rss",
+              "subreddit": "stocks"}]
     monkeypatch.setattr(reddit, "_fetch_subreddit", lambda *a, **k: posts)
     out = reddit.fetch_reddit_posts(
-        "AAPL", subreddits=("stocks",), inter_request_delay=0,
+        "AAPL", subreddits=("stocks",),
         start_date="2026-05-01", end_date="2026-05-08",
     )
     assert "INRANGE" in out
