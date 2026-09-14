@@ -253,3 +253,33 @@ def test_bind_tools_keeps_original_model_unbound(provider, tmp_path):
 
     assert bound.bound_tools == (get_stock_data,)
     assert llm.bound_tools == ()
+
+
+def test_each_call_logs_its_graph_step_and_reply(monkeypatch, tmp_path, caplog):
+    import logging
+    from typing import TypedDict
+
+    from langgraph.graph import END, START, StateGraph
+
+    _fake_cli(monkeypatch, ['{"tool_calls": [{"name": "get_stock_data", "args": {}}]}', "Bayer looks cheap."])
+    llm = _claude(tmp_path)
+
+    class State(TypedDict):
+        answer: str
+
+    def analyst(state):
+        llm.bind_tools([get_stock_data]).invoke("go again")
+        return {"answer": llm.invoke("go").content}
+
+    graph = StateGraph(State)
+    graph.add_node("News Analyst", analyst)
+    graph.add_edge(START, "News Analyst")
+    graph.add_edge("News Analyst", END)
+
+    with caplog.at_level(logging.INFO, logger="tradingagents.llm_clients.subscription_client"):
+        graph.compile().invoke({"answer": ""})
+
+    records = [r for r in caplog.records if r.name == "tradingagents.llm_clients.subscription_client"]
+    assert [r.step for r in records] == ["News Analyst", "News Analyst"]
+    assert records[0].reply == "requested get_stock_data"
+    assert records[1].reply == "Bayer looks cheap."

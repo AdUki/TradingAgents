@@ -15,11 +15,13 @@ prompt-constrained JSON parsing.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from typing import Any
 
@@ -273,11 +275,26 @@ class SubscriptionCLIChatModel(BaseChatModel):
         if stop:
             prompt += "\n\nStop sequences to respect: " + ", ".join(stop)
 
+        started = time.monotonic()
         content = self._run_cli(system, prompt)
+        elapsed = time.monotonic() - started
 
         tool_calls = None
         if self.bound_tools:
             tool_calls = _parse_tool_calls(content, {_tool_spec(t)["name"] for t in self.bound_tools})
+
+        # One line per call, since a ticker's analysis runs silently for minutes.
+        # LangGraph passes the running node's name in the run metadata.
+        step = (getattr(run_manager, "metadata", None) or {}).get("langgraph_node") or "model call"
+        if tool_calls:
+            outcome = reply = "requested " + ", ".join(call["name"] for call in tool_calls)
+        else:
+            outcome = f"answered ({len(content):,} chars)"
+            reply = " ".join(content.split())[:200]
+        logging.getLogger(__name__).info(
+            "%s: %s in %.0fs", step, outcome, elapsed, extra={"step": step, "reply": reply}
+        )
+
         message = AIMessage(content="", tool_calls=tool_calls) if tool_calls else AIMessage(content=content)
         return ChatResult(generations=[ChatGeneration(message=message)])
 

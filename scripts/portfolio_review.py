@@ -30,15 +30,21 @@ TRADINGAGENTS_LLM_PROVIDER) to be set. Analyzing many tickers makes that
 many full agent runs, which costs real LLM tokens and takes a few minutes
 per ticker — start with a short list.
 
-The summary is also written to <results_dir>/portfolio_reviews/<date>.txt.
+Progress is printed as it happens (one line per model call with the
+subscription CLI providers, plus a heartbeat every minute) and kept in
+<results_dir>/progress.json while the run lasts. The summary is written to
+<results_dir>/portfolio_reviews/<date>.txt.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime
+import json
+import logging
 import os
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -54,6 +60,9 @@ if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != VENV_PYTHON.parent.par
 from cli.utils import detect_asset_type  # noqa: E402
 from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
 from tradingagents.graph.trading_graph import TradingAgentsGraph  # noqa: E402
+
+HEARTBEAT_SECONDS = 60
+STEP_LOGGER = "tradingagents.llm_clients.subscription_client"
 
 
 def load_tickers(args: argparse.Namespace) -> list[str]:
@@ -110,6 +119,61 @@ def window_block_reason(
     return None
 
 
+def minutes_since(stamp: str) -> int:
+    return int((datetime.datetime.now() - datetime.datetime.fromisoformat(stamp)).total_seconds() // 60)
+
+
+class Progress(logging.Handler):
+    """Tracks the ticker and step being analyzed, prints a heartbeat, and
+    mirrors the state to a JSON file that show_stocks.py reads."""
+
+    def __init__(self, path: Path, total: int):
+        super().__init__(level=logging.INFO)
+        self.path = path
+        self.state_lock = threading.Lock()
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        self.state = {
+            "run_started": now, "total": total, "done": 0, "index": 0,
+            "ticker": None, "ticker_started": None, "step": None, "reply": None, "updated": now,
+        }
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+
+    def start(self) -> None:
+        self.update()
+        self.thread.start()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        step = getattr(record, "step", None)
+        if step:
+            self.update(step=step, reply=getattr(record, "reply", None))
+
+    def update(self, **changes) -> None:
+        with self.state_lock:
+            self.state.update(changes, updated=datetime.datetime.now().isoformat(timespec="seconds"))
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps(self.state, indent=2))
+            tmp.replace(self.path)
+
+    def _heartbeat(self) -> None:
+        while not self.stopped.wait(HEARTBEAT_SECONDS):
+            with self.state_lock:
+                state = dict(self.state)
+            if state["ticker"]:
+                step = f", last step: {state['step']}" if state["step"] else ""
+                print(
+                    f"  ... still analyzing {state['ticker']} ({state['index']}/{state['total']}, "
+                    f"{minutes_since(state['ticker_started'])}m){step}",
+                    flush=True,
+                )
+            self.update()
+
+    def finish(self) -> None:
+        self.stopped.set()
+        self.thread.join()
+        self.path.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("tickers", nargs="*", help="Tickers to analyze, e.g. AAPL TSLA BTC-USD")
@@ -127,31 +191,49 @@ def main() -> int:
     config = DEFAULT_CONFIG.copy()
     ta = TradingAgentsGraph(debug=False, config=config)
 
+    results_dir = Path(config["results_dir"])
+    results_dir.mkdir(parents=True, exist_ok=True)
+    progress = Progress(results_dir / "progress.json", len(tickers))
+    step_log = logging.getLogger(STEP_LOGGER)
+    step_log.setLevel(logging.INFO)
+    step_log.propagate = False
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter("  %(asctime)s %(message)s", "%H:%M:%S"))
+    step_log.addHandler(console)
+    step_log.addHandler(progress)
+    progress.start()
+
     results: list[tuple[str, str]] = []
     longest_run = datetime.timedelta(0)
     failed = False
-    for i, ticker in enumerate(tickers):
-        if args.window:
-            reason = window_block_reason(args.window, datetime.datetime.now(), longest_run)
-            if reason:
-                print(f"\nStopping: {reason}. Skipped: {', '.join(tickers[i:])}", flush=True)
-                results.extend((t, "SKIPPED (outside window)") for t in tickers[i:])
-                break
-        asset_type = detect_asset_type(ticker).value
-        print(f"\n=== {ticker} ({args.date}, {asset_type}) ===", flush=True)
-        started = datetime.datetime.now()
-        try:
-            _, decision = ta.propagate(ticker, args.date, asset_type=asset_type)
-        except Exception as exc:  # noqa: BLE001 - keep going, report every ticker
-            print(f"  ERROR: {exc}", flush=True)
-            traceback.print_exc()
-            results.append((ticker, f"ERROR: {exc}"))
-            failed = True
-            continue
-        finally:
-            longest_run = max(longest_run, datetime.datetime.now() - started)
-        print(f"  Decision: {decision}", flush=True)
-        results.append((ticker, decision))
+    try:
+        for i, ticker in enumerate(tickers):
+            if args.window:
+                reason = window_block_reason(args.window, datetime.datetime.now(), longest_run)
+                if reason:
+                    print(f"\nStopping: {reason}. Skipped: {', '.join(tickers[i:])}", flush=True)
+                    results.extend((t, "SKIPPED (outside window)") for t in tickers[i:])
+                    break
+            asset_type = detect_asset_type(ticker).value
+            started = datetime.datetime.now()
+            print(f"\n=== {ticker} ({i + 1}/{len(tickers)}, {args.date}, {asset_type}) started {started:%H:%M} ===", flush=True)
+            progress.update(ticker=ticker, index=i + 1, ticker_started=started.isoformat(timespec="seconds"), step=None, reply=None)
+            try:
+                _, decision = ta.propagate(ticker, args.date, asset_type=asset_type)
+            except Exception as exc:  # noqa: BLE001 - keep going, report every ticker
+                print(f"  ERROR: {exc}", flush=True)
+                traceback.print_exc()
+                results.append((ticker, f"ERROR: {exc}"))
+                failed = True
+                continue
+            finally:
+                took = datetime.datetime.now() - started
+                longest_run = max(longest_run, took)
+                progress.update(done=i + 1)
+            print(f"  Decision: {decision} (took {int(took.total_seconds() // 60)}m)", flush=True)
+            results.append((ticker, decision))
+    finally:
+        progress.finish()
 
     width = max(len(t) for t, _ in results)
     summary = "\n".join(
@@ -160,7 +242,7 @@ def main() -> int:
     )
     print("\n" + summary)
 
-    summary_path = Path(config["results_dir"]) / "portfolio_reviews" / f"{args.date}.txt"
+    summary_path = results_dir / "portfolio_reviews" / f"{args.date}.txt"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(summary + "\n")
     print(f"\nSummary saved to {summary_path}")
