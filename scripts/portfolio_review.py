@@ -30,6 +30,9 @@ TRADINGAGENTS_LLM_PROVIDER) to be set. Analyzing many tickers makes that
 many full agent runs, which costs real LLM tokens and takes a few minutes
 per ticker — start with a short list.
 
+Only one review runs at a time: a second launch exits while another holds
+<results_dir>/portfolio_review.lock.
+
 Progress is printed as it happens (one line per model call with the
 subscription CLI providers, plus a heartbeat every minute) and kept in
 <results_dir>/progress.json while the run lasts. The summary is written to
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import fcntl
 import json
 import logging
 import os
@@ -47,6 +51,7 @@ import sys
 import threading
 import traceback
 from pathlib import Path
+from typing import IO
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
@@ -57,12 +62,33 @@ DEFAULT_PORTFOLIO = REPO_ROOT / "portfolio.txt"
 if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != VENV_PYTHON.parent.parent.resolve():
     os.execv(VENV_PYTHON, [str(VENV_PYTHON), *sys.argv])
 
-from cli.utils import detect_asset_type  # noqa: E402
 from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
-from tradingagents.graph.trading_graph import TradingAgentsGraph  # noqa: E402
 
 HEARTBEAT_SECONDS = 60
 STEP_LOGGER = "tradingagents.llm_clients.subscription_client"
+
+
+def acquire_run_lock(path: Path) -> tuple[IO[str] | None, str]:
+    """Take the single-run lock: (open lock file, "") or (None, current holder).
+
+    The OS drops the lock when the holding process exits, even on a crash or
+    kill, so a stale lock can't block the next run. Keep the returned file open
+    for as long as the run lasts.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")  # noqa: SIM115 - must stay open to hold the lock
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        holder = handle.read().strip() or "unknown process"
+        handle.close()
+        return None, holder
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid {os.getpid()}, started {datetime.datetime.now():%Y-%m-%d %H:%M}\n")
+    handle.flush()
+    return handle, ""
 
 
 def load_tickers(args: argparse.Namespace) -> list[str]:
@@ -182,17 +208,25 @@ def main() -> int:
     parser.add_argument("--window", type=parse_window, help="Only start tickers inside this local-time window, e.g. 02:00-06:00")
     args = parser.parse_args()
 
+    config = DEFAULT_CONFIG.copy()
+    results_dir = Path(config["results_dir"])
+    lock, holder = acquire_run_lock(results_dir / "portfolio_review.lock")
+    if lock is None:
+        print(f"Another portfolio review is already running ({holder}); not starting a second one.", flush=True)
+        return 1
+
     if not args.tickers and not args.file and DEFAULT_PORTFOLIO.exists():
         args.file = [str(DEFAULT_PORTFOLIO)]
     tickers = load_tickers(args)
     if not tickers:
         parser.error(f"no tickers given — pass them as arguments, via --file, or list them in {DEFAULT_PORTFOLIO}")
 
-    config = DEFAULT_CONFIG.copy()
+    # Imported after the lock: loading the graph takes a while on a Pi.
+    from cli.utils import detect_asset_type
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
     ta = TradingAgentsGraph(debug=False, config=config)
 
-    results_dir = Path(config["results_dir"])
-    results_dir.mkdir(parents=True, exist_ok=True)
     progress = Progress(results_dir / "progress.json", len(tickers))
     step_log = logging.getLogger(STEP_LOGGER)
     step_log.setLevel(logging.INFO)
@@ -247,6 +281,7 @@ def main() -> int:
     summary_path.write_text(summary + "\n")
     print(f"\nSummary saved to {summary_path}")
 
+    lock.close()
     return 1 if failed else 0
 
 
