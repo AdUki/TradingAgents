@@ -577,3 +577,78 @@ def test_sync_counts_a_pending_order_as_reserved_cash():
     snapshot = sync.build_snapshot(portfolio, {}, {}, "real")
     assert snapshot["credit"] == 1196.68 and snapshot["pending_orders_amount"] == 50.0
     assert snapshot["positions"][0]["stop_loss_rate"] == 0.0001
+
+
+# --- several positions in one stock -------------------------------------------------
+
+def _position_row(ticker, position_id, *, is_buy=True, amount=100.0, value=110.0, pnl=10.0, stop_loss=None, open_rate=50.0):
+    return {
+        "ticker": ticker, "symbol": ticker, "position_id": position_id, "is_buy": is_buy, "open_rate": open_rate,
+        "amount": amount, "value": value, "pnl": pnl, "stop_loss": stop_loss, "rating": "Hold",
+    }
+
+
+@pytest.mark.unit
+def test_group_holdings_combines_positions_per_stock():
+    rows = [
+        _position_row("AAPL", 1, amount=100.0, value=120.0, pnl=20.0, stop_loss=90.0),
+        _position_row("AAPL", 2, amount=50.0, value=45.0, pnl=-5.0),
+        _position_row("MSFT", 3, amount=200.0, value=210.0, pnl=None),
+    ]
+
+    holdings = {h["name"]: h for h in account.group_holdings(rows, equity=1000.0)}
+
+    aapl = holdings["AAPL"]
+    assert (aapl["positions"], aapl["buys"], aapl["sells"]) == (2, 2, 0)
+    assert (aapl["amount"], aapl["value"], aapl["pnl"]) == (150.0, 165.0, 15.0)
+    assert aapl["allocation"] == pytest.approx(0.165)
+    assert aapl["unprotected"] == 1
+    assert holdings["MSFT"]["pnl"] is None  # unknown P/L stays unknown, not zero
+    assert [h["name"] for h in account.group_holdings(rows, equity=1000.0)] == ["MSFT", "AAPL"]
+
+
+@pytest.mark.unit
+def test_group_holdings_counts_buys_and_sells():
+    rows = [_position_row("TSLA", 1), _position_row("TSLA", 2, is_buy=False)]
+    (holding,) = account.group_holdings(rows, equity=500.0)
+    assert (holding["buys"], holding["sells"]) == (1, 1)
+
+
+@pytest.mark.unit
+def test_position_label_adds_entry_only_for_repeated_stocks():
+    rows = [
+        _position_row("AAPL", 1, open_rate=238.0),
+        _position_row("AAPL", 2, is_buy=False, open_rate=330.5),
+        _position_row("MSFT", 3),
+    ]
+    assert account.position_label(rows[0], rows) == "AAPL (bought at 238)"
+    assert account.position_label(rows[1], rows) == "AAPL (sold at 330.5)"
+    assert account.position_label(rows[2], rows) == "MSFT"
+
+
+@pytest.mark.unit
+def test_group_holdings_counts_pending_orders_in_held_stocks_only():
+    rows = [_position_row("CLS", 1, value=165.0)]
+    pending = [
+        {"ticker": "CLS", "symbol_full": "CLS", "amount": 260.0, "is_buy": True},
+        {"ticker": "AVGO", "symbol_full": "AVGO.RTH", "amount": 260.0, "is_buy": True},
+    ]
+    (holding,) = account.group_holdings(rows, equity=2500.0, pending_orders=pending)
+    assert holding["pending"] == 260.0
+
+
+@pytest.mark.unit
+def test_sync_lists_each_pending_order_with_its_ticker():
+    portfolio = {
+        "ordersForOpen": [
+            {"instrumentID": 13589, "amount": 260.0, "isBuy": True, "mirrorID": 0},
+            {"instrumentID": 777, "amount": 50.0, "isBuy": True, "mirrorID": 12},
+        ],
+        "orders": [{"instrumentID": 14350, "amount": 100.0, "isBuy": True}],
+    }
+    infos = {
+        13589: SimpleNamespace(symbol_full="CLS", instrument_type_id=5),
+        14350: SimpleNamespace(symbol_full="AVGO.RTH", instrument_type_id=5),
+    }
+    pending = sync.pending_orders(portfolio, infos, {5: "Stocks"})
+    assert [(o["ticker"], o["amount"]) for o in pending] == [("CLS", 260.0), ("AVGO", 100.0)]

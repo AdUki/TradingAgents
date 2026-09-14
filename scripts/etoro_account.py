@@ -199,6 +199,7 @@ def build_row(position: dict, ratings: dict[str, tuple[str, str]]) -> dict:
         "is_buy": position["is_buy"],
         "leverage": position["leverage"],
         "open_rate": entry,
+        "open_date": position.get("open_date"),
         "amount": position["amount"],
         "value": position["amount"],
         "pnl": None,
@@ -441,6 +442,43 @@ def row_name(row: dict) -> str:
     return row["ticker"] or row["symbol"]
 
 
+def position_label(row: dict, rows: list[dict]) -> str:
+    """The ticker, plus the entry when you hold several positions in that stock."""
+    name = row_name(row)
+    if sum(row_name(other) == name for other in rows) > 1:
+        return f"{name} ({'bought' if row['is_buy'] else 'sold'} at {row['open_rate']:g})"
+    return name
+
+
+def group_holdings(rows: list[dict], equity: float, pending_orders: list[dict] = ()) -> list[dict]:
+    """Positions combined per stock: one stock can be held through several buys or sells.
+
+    ``pending`` is the amount of your pending orders in a stock you already hold,
+    so an order on its way counts before it fills.
+    """
+    holdings: dict[str, dict] = {}
+    for row in rows:
+        holding = holdings.setdefault(row_name(row), {
+            "name": row_name(row), "ticker": row["ticker"], "rating": row["rating"],
+            "positions": 0, "buys": 0, "sells": 0, "amount": 0.0, "value": 0.0, "pnl": 0.0, "unprotected": 0,
+            "pending": 0.0,
+        })
+        holding["positions"] += 1
+        holding["buys" if row["is_buy"] else "sells"] += 1
+        holding["amount"] += row["amount"]
+        holding["value"] += row["value"]
+        holding["pnl"] = None if holding["pnl"] is None or row["pnl"] is None else holding["pnl"] + row["pnl"]
+        if row["amount"] and row["stop_loss"] is None:
+            holding["unprotected"] += 1
+    for order in pending_orders:
+        holding = holdings.get(order.get("ticker") or order.get("symbol_full"))
+        if holding is not None:
+            holding["pending"] += order.get("amount") or 0.0
+    for holding in holdings.values():
+        holding["allocation"] = holding["value"] / equity if equity else None
+    return sorted(holdings.values(), key=lambda h: -h["value"])
+
+
 def describe_change(row: dict) -> str:
     changes = []
     if row["recommended_stop_loss"] is not None:
@@ -513,7 +551,7 @@ def _apply_locked(rows: list[dict], snapshot: dict, *, assume_yes: bool) -> None
         return
     print(f"Planned changes on your REAL eToro account ({len(planned)}):")
     for row in planned:
-        print(f"  {row_name(row):<9} {describe_change(row)} (eToro price {row['live_price']:g})")
+        print(f"  {position_label(row, rows):<9} {describe_change(row)} (eToro price {row['live_price']:g})")
     if not assume_yes:
         if not stdin_is_terminal():
             print("Not sending: confirmation needs a terminal (or pass --yes).")
@@ -597,16 +635,27 @@ def main() -> int:
     warnings = []
     if equity and available_cash / equity < LOW_CASH_WARNING:
         warnings.append(f"Only ${available_cash:,.2f} ({available_cash / equity:.1%}) is free to invest.")
+    holdings = group_holdings(rows, equity, snapshot.get("pending_orders", []))
     warnings += [
-        f"{row['ticker']} is {row['allocation']:.0%} of the account."
-        for row in rows
-        if row["allocation"] and row["allocation"] > CONCENTRATION_WARNING
+        f"{h['name']} is {h['allocation']:.0%} of the account"
+        + (f" across {h['positions']} positions." if h["positions"] > 1 else ".")
+        for h in holdings
+        if h["allocation"] and h["allocation"] > CONCENTRATION_WARNING
     ]
-    unprotected = [row_name(row) for row in rows if row["stop_loss"] is None and row["amount"]]
+    warnings += [
+        f"{h['name']}: you hold both buy and sell positions, which offset each other."
+        for h in holdings
+        if h["buys"] and h["sells"]
+    ]
+    unprotected = [
+        h["name"] if h["unprotected"] == h["positions"] else f"{h['name']} ({h['unprotected']} of {h['positions']} positions)"
+        for h in holdings
+        if h["unprotected"]
+    ]
     if unprotected:
         warnings.append(f"No stop loss set on: {', '.join(unprotected)}.")
     tight = [
-        f"{row_name(row)} ({row['stop_loss']:g}, {1 - row['stop_loss'] / row['price']:.1%} below)"
+        f"{position_label(row, rows)} ({row['stop_loss']:g}, {1 - row['stop_loss'] / row['price']:.1%} below)"
         for row in rows
         if row["atr"] is not None and row["is_buy"] and row["stop_loss"] and 1 - row["stop_loss"] / row["price"] < MIN_STOP_DISTANCE
     ]
@@ -626,6 +675,8 @@ def main() -> int:
         "positions_value": positions_value,
         "equity": equity,
         "cash_share": available_cash / equity if equity else None,
+        "holdings": holdings,
+        "pending_order_list": snapshot.get("pending_orders", []),
         "positions": rows,
         "warnings": warnings,
     }
@@ -638,7 +689,7 @@ def main() -> int:
     for row in rows:
         if row["status"] != "ok":
             change = describe_change(row)
-            print(f"  {row_name(row):<9} {row['status']}" + (f": {change}" if change else ""))
+            print(f"  {position_label(row, rows):<9} {row['status']}" + (f": {change}" if change else ""))
     for warning in warnings:
         print(f"  ! {warning}")
     print(f"Wrote {REPORT}")

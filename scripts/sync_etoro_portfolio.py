@@ -130,6 +130,23 @@ def mirrors_invested(portfolio: dict) -> float:
     )
 
 
+def pending_orders(portfolio: dict, infos: Mapping[int, object], type_names: Mapping[int, str]) -> list[dict]:
+    """Your own (not copy-trading) pending orders, one entry each."""
+    orders = [o for o in portfolio.get("ordersForOpen", []) if not o.get("mirrorID")] + portfolio.get("orders", [])
+    pending = []
+    for order in orders:
+        info = infos.get(order.get("instrumentID"))
+        type_name = type_names.get(info.instrument_type_id, "") if info else ""
+        pending.append({
+            "instrument_id": order.get("instrumentID"),
+            "symbol_full": info.symbol_full if info else str(order.get("instrumentID")),
+            "ticker": to_yahoo_symbol(info.symbol_full, type_name) if info else None,
+            "is_buy": order.get("isBuy"),
+            "amount": order.get("amount", 0.0),
+        })
+    return pending
+
+
 def build_snapshot(portfolio: dict, infos: Mapping[int, object], type_names: Mapping[int, str], mode: str) -> dict:
     positions = []
     for p in portfolio.get("positions", []):
@@ -155,6 +172,7 @@ def build_snapshot(portfolio: dict, infos: Mapping[int, object], type_names: Map
         "mode": mode,
         "credit": portfolio.get("credit", 0.0),
         "pending_orders_amount": pending_orders_amount(portfolio),
+        "pending_orders": pending_orders(portfolio, infos, type_names),
         "mirrors_invested": mirrors_invested(portfolio),
         "positions": positions,
     }
@@ -171,7 +189,8 @@ async def fetch_instruments(instrument_ids: list[int]) -> tuple[dict[int, object
 def fetch_portfolio() -> tuple[dict, dict[int, object], dict[int, str]]:
     with httpx.Client() as client:
         portfolio = etoro_api.get_portfolio(client)
-    instrument_ids = sorted({p["instrumentID"] for p in portfolio.get("positions", [])})
+    held_or_ordered = portfolio.get("positions", []) + portfolio.get("ordersForOpen", []) + portfolio.get("orders", [])
+    instrument_ids = sorted({p["instrumentID"] for p in held_or_ordered if p.get("instrumentID")})
     infos, type_names = asyncio.run(fetch_instruments(instrument_ids))
     return portfolio, infos, type_names
 
