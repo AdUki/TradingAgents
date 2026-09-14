@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Run TradingAgents analysis over a list of tickers you hold and print a
 summary table of the decisions.
 
@@ -8,30 +9,49 @@ you can check your whole eToro (or any) portfolio in one pass instead of
 running the CLI once per stock.
 
 Usage:
-    # tickers as arguments
-    python scripts/portfolio_review.py AAPL TSLA BTC-USD
+    # tickers from portfolio.txt in the repo root (the default)
+    scripts/portfolio_review.py
 
-    # or from a file, one ticker per line (# comments allowed)
-    python scripts/portfolio_review.py --file my_portfolio.txt
+    # tickers as arguments
+    scripts/portfolio_review.py AAPL TSLA BTC-USD
+
+    # or from another file, one ticker per line (# comments allowed)
+    scripts/portfolio_review.py --file my_portfolio.txt
 
     # pin the analysis date (defaults to today)
-    python scripts/portfolio_review.py AAPL TSLA --date 2026-09-01
+    scripts/portfolio_review.py AAPL TSLA --date 2026-09-01
+
+    # only analyze inside a local-time window (for scheduled runs)
+    scripts/portfolio_review.py --window 02:00-06:00
 
 Requires the API key for whichever provider is configured (see .env /
 TRADINGAGENTS_LLM_PROVIDER) to be set. Analyzing many tickers makes that
 many full agent runs, which costs real LLM tokens and takes a few minutes
 per ticker — start with a short list.
+
+The summary is also written to <results_dir>/portfolio_reviews/<date>.txt.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import sys
+from pathlib import Path
 
-from cli.utils import detect_asset_type
-from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.graph.trading_graph import TradingAgentsGraph
+REPO_ROOT = Path(__file__).resolve().parent.parent
+VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+DEFAULT_PORTFOLIO = REPO_ROOT / "portfolio.txt"
+
+# Run directly, the shebang picks the system python, which lacks the project's
+# dependencies; switch to the repo's venv.
+if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != VENV_PYTHON.parent.parent.resolve():
+    os.execv(VENV_PYTHON, [str(VENV_PYTHON), *sys.argv])
+
+from cli.utils import detect_asset_type  # noqa: E402
+from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
+from tradingagents.graph.trading_graph import TradingAgentsGraph  # noqa: E402
 
 
 def load_tickers(args: argparse.Namespace) -> list[str]:
@@ -52,41 +72,92 @@ def load_tickers(args: argparse.Namespace) -> list[str]:
     return ordered
 
 
+def parse_window(text: str) -> tuple[datetime.time, datetime.time]:
+    try:
+        start_s, end_s = text.split("-")
+        start = datetime.time.fromisoformat(start_s)
+        end = datetime.time.fromisoformat(end_s)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected HH:MM-HH:MM, got {text!r}") from exc
+    if start >= end:
+        raise argparse.ArgumentTypeError("window must start before it ends, within one day")
+    return start, end
+
+
+def window_block_reason(
+    window: tuple[datetime.time, datetime.time],
+    now: datetime.datetime,
+    longest_run: datetime.timedelta,
+) -> str | None:
+    """Why a ticker must not start now, or None if it fits in the window.
+
+    A ticker is only started when the longest ticker so far would still finish
+    before the window closes, so runs don't spill past the end.
+    """
+    start, end = window
+    if not start <= now.time() < end:
+        return f"{now:%H:%M} is outside {start:%H:%M}-{end:%H:%M}"
+    window_end = now.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
+    if now + longest_run > window_end:
+        return f"not enough time left before {end:%H:%M} (a ticker takes up to {longest_run})"
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("tickers", nargs="*", help="Tickers to analyze, e.g. AAPL TSLA BTC-USD")
-    parser.add_argument("--file", help="Path to a file with one ticker per line")
+    parser.add_argument("--file", help=f"Path to a file with one ticker per line (default: {DEFAULT_PORTFOLIO} when no tickers are given)")
     parser.add_argument("--date", default=datetime.date.today().isoformat(), help="Analysis date, YYYY-MM-DD (default: today)")
+    parser.add_argument("--window", type=parse_window, help="Only start tickers inside this local-time window, e.g. 02:00-06:00")
     args = parser.parse_args()
 
+    if not args.tickers and not args.file and DEFAULT_PORTFOLIO.exists():
+        args.file = str(DEFAULT_PORTFOLIO)
     tickers = load_tickers(args)
     if not tickers:
-        parser.error("no tickers given — pass them as arguments or via --file")
+        parser.error(f"no tickers given — pass them as arguments, via --file, or list them in {DEFAULT_PORTFOLIO}")
 
     config = DEFAULT_CONFIG.copy()
     ta = TradingAgentsGraph(debug=False, config=config)
 
     results: list[tuple[str, str]] = []
-    for ticker in tickers:
+    longest_run = datetime.timedelta(0)
+    failed = False
+    for i, ticker in enumerate(tickers):
+        if args.window:
+            reason = window_block_reason(args.window, datetime.datetime.now(), longest_run)
+            if reason:
+                print(f"\nStopping: {reason}. Skipped: {', '.join(tickers[i:])}", flush=True)
+                results.extend((t, "SKIPPED (outside window)") for t in tickers[i:])
+                break
         asset_type = detect_asset_type(ticker).value
         print(f"\n=== {ticker} ({args.date}, {asset_type}) ===", flush=True)
+        started = datetime.datetime.now()
         try:
             _, decision = ta.propagate(ticker, args.date, asset_type=asset_type)
         except Exception as exc:  # noqa: BLE001 - keep going, report every ticker
-            print(f"  ERROR: {exc}")
+            print(f"  ERROR: {exc}", flush=True)
             results.append((ticker, f"ERROR: {exc}"))
+            failed = True
             continue
-        print(f"  Decision: {decision}")
+        finally:
+            longest_run = max(longest_run, datetime.datetime.now() - started)
+        print(f"  Decision: {decision}", flush=True)
         results.append((ticker, decision))
 
-    print("\n" + "=" * 40)
-    print(f"Portfolio review — {args.date}")
-    print("=" * 40)
     width = max(len(t) for t, _ in results)
-    for ticker, decision in results:
-        print(f"  {ticker:<{width}}  {decision}")
+    summary = "\n".join(
+        ["=" * 40, f"Portfolio review — {args.date}", "=" * 40]
+        + [f"  {ticker:<{width}}  {decision}" for ticker, decision in results]
+    )
+    print("\n" + summary)
 
-    return 0
+    summary_path = Path(config["results_dir"]) / "portfolio_reviews" / f"{args.date}.txt"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(summary + "\n")
+    print(f"\nSummary saved to {summary_path}")
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
